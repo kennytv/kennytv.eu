@@ -5,9 +5,9 @@ $(document).ready(function() {
 				'verticalCentered': false,
 				'scrollingSpeed': 600,
 				'autoScrolling': false,
+				'fitToSection': false,
 				'css3': true,
-				'navigation': true,
-				'navigationPosition': 'right',
+				'navigation': false,
 			});
 		});
 
@@ -15,5 +15,4 @@ $(document).ready(function() {
 $(function()
 {
     new WOW().init();
-    $(".rotate").textrotator();
 })
