@@ -1,0 +1,45 @@
+name: Update servers.json
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "update-data"
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run collector
+        run: |
+          python scripts/servers/main.py -n
+          python scripts/servers/collect-data-to-file.py --date "$(date -u +%Y-%m-%d)"
+
+      - name: Commit changes
+        run: |
+          git config user.name "automation"
+          git config user.email "action@github.com"
+
+          git add public/servers.json
+
+          git diff --cached --quiet || git commit -m "Update servers.json"
+          git push

@@ -1,7 +1,27 @@
-### IntelliJ IDEA ###
+# Next.js
+.next/
 out/
 !**/src/main/**/out/
 !**/src/test/**/out/
+
+# Dependencies
+node_modules/
+
+# Bun
+bun.lockb
+
+# Data
+data/
+
+# Build
+*.log
+
+# TypeScript
+next-env.d.ts
+
+### IntelliJ IDEA ###
+.idea/
+*.iml
 
 ### Eclipse ###
 .apt_generated
@@ -18,7 +38,6 @@ bin/
 ### NetBeans ###
 /nbproject/private/
 /nbbuild/
-/dist/
 /nbdist/
 /.nb-gradle/
 
@@ -27,5 +46,3 @@ bin/
 
 ### Mac OS ###
 .DS_Store
-
-servers.json
