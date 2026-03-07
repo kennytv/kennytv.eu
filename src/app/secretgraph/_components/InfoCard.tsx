@@ -22,7 +22,7 @@ export default function InfoCard() {
           >
             Multiverse
           </a>
-          , with Spigot at (less than) 10%.
+          , with Spigot at (less than) 5%, with global stats below 10%.
         </p>
         <hr className="border-border" />
         <p>
