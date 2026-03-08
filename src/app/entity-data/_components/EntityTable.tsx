@@ -50,7 +50,8 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
               <tr className="border-b border-border text-left text-text-dim">
                 <th className="py-2 pr-4 font-medium">Index</th>
                 <th className="py-2 pr-4 font-medium">Data Type</th>
-                <th className="py-2 font-medium">Field Name</th>
+                <th className="py-2 pr-4 font-medium">Field Name</th>
+                <th className="py-2 font-medium">Default</th>
               </tr>
             </thead>
             <tbody>
@@ -60,7 +61,7 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
                     <tr key={`${group.entityName}-${field.fieldName}`} className="border-b border-border/50">
                       <td className="py-1.5 pr-4 font-mono text-text-dim/60">{field.index}</td>
                       <td className="py-1.5 pr-4 font-mono text-amber/50">{field.dataType}</td>
-                      <td className="py-1.5 font-mono text-text-dim">
+                      <td className="py-1.5 pr-4 font-mono text-text-dim">
                         {field.fieldName}
                         {i === 0 && (
                           <button
@@ -72,6 +73,7 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
                           </button>
                         )}
                       </td>
+                      <td className="py-1.5 font-mono text-text-dim/60">{field.defaultValue ?? ''}</td>
                     </tr>
                   )),
                 )}
@@ -79,7 +81,8 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
                 <tr key={field.fieldName} className="border-b border-border/50">
                   <td className="py-1.5 pr-4 font-mono text-text-muted">{field.index}</td>
                   <td className="py-1.5 pr-4 font-mono text-amber">{field.dataType}</td>
-                  <td className="py-1.5 font-mono text-text">{field.fieldName}</td>
+                  <td className="py-1.5 pr-4 font-mono text-text">{field.fieldName}</td>
+                  <td className="py-1.5 font-mono text-text-muted">{field.defaultValue ?? ''}</td>
                 </tr>
               ))}
             </tbody>

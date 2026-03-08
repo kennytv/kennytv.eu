@@ -37,7 +37,7 @@ def do():
     os.makedirs("data", exist_ok=True)
     fileName = date.today().strftime("data/%Y-%m-%d.json")
     with open(fileName, "w") as file:
-        json.dump(data, file)
+        json.dump(data, file, indent=2)
         print("Saved data to", fileName)
 
 

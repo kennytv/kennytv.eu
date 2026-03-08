@@ -4,6 +4,7 @@ export interface EntityField {
   index: number;
   dataType: string;
   fieldName: string;
+  defaultValue?: string;
 }
 
 export interface EntityInfo {
@@ -14,9 +15,18 @@ export interface EntityInfo {
 /** Map of entity name -> entity info for a single version */
 export type VersionEntities = Record<string, EntityInfo>;
 
-export interface EntityDataJson {
-  versions: string[];
-  data: Record<string, VersionEntities>;
+/** Fetch the version list from the server */
+export async function fetchVersions(): Promise<string[]> {
+  const res = await fetch('/entity-data/versions.json');
+  if (!res.ok) throw new Error(`Failed to fetch versions: ${res.status}`);
+  return res.json();
+}
+
+/** Fetch entity data for a single version */
+export async function fetchVersionData(version: string): Promise<VersionEntities> {
+  const res = await fetch(`/entity-data/${encodeURIComponent(version)}.json`);
+  if (!res.ok) throw new Error(`Failed to fetch version ${version}: ${res.status}`);
+  return res.json();
 }
 
 /* ── Diff Types ────────────────────────────────────── */

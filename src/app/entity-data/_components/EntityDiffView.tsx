@@ -1,47 +1,51 @@
 'use client';
 
 import { useState, useMemo, useCallback } from 'react';
-import type { EntityDataJson, EntityDiff } from '../_lib/entityDataUtils';
+import type { VersionEntities, EntityDiff } from '../_lib/entityDataUtils';
 import { computeDiff, filterDiffs } from '../_lib/entityDataUtils';
-import { getUrlParams, updateUrlParam } from '../_lib/useUrlState';
+import { updateUrlParam } from '../_lib/useUrlState';
 import VersionSelector from './VersionSelector';
 import EntitySearch from './EntitySearch';
 import DiffCard from './DiffCard';
 import BackToTop from './BackToTop';
 
 interface EntityDiffViewProps {
-  data: EntityDataJson;
+  versions: string[];
+  leftVersion: string;
+  rightVersion: string;
+  leftEntities: VersionEntities | null;
+  rightEntities: VersionEntities | null;
+  leftLoading: boolean;
+  rightLoading: boolean;
+  onLeftVersionChange: (v: string) => void;
+  onRightVersionChange: (v: string) => void;
   onBack: () => void;
 }
 
-export default function EntityDiffView({ data, onBack }: EntityDiffViewProps) {
-  const versions = data.versions;
-
-  // Initialize from URL params
-  const [leftVersion, setLeftVersionState] = useState(() => {
-    const param = getUrlParams().get('from');
-    return param && versions.includes(param) ? param : (versions.length >= 2 ? versions[versions.length - 2] : versions[0]);
-  });
-  const [rightVersion, setRightVersionState] = useState(() => {
-    const param = getUrlParams().get('to');
-    return param && versions.includes(param) ? param : versions[versions.length - 1];
-  });
+export default function EntityDiffView({
+  versions, leftVersion, rightVersion,
+  leftEntities, rightEntities, leftLoading, rightLoading,
+  onLeftVersionChange, onRightVersionChange, onBack,
+}: EntityDiffViewProps) {
   const [query, setQuery] = useState('');
   const [hideIndexOnly, setHideIndexOnly] = useState(true);
 
   const setLeftVersion = useCallback((v: string) => {
-    setLeftVersionState(v);
+    onLeftVersionChange(v);
     updateUrlParam('from', v);
-  }, []);
+  }, [onLeftVersionChange]);
 
   const setRightVersion = useCallback((v: string) => {
-    setRightVersionState(v);
+    onRightVersionChange(v);
     updateUrlParam('to', v);
-  }, []);
+  }, [onRightVersionChange]);
+
+  const bothLoaded = leftEntities && rightEntities;
+  const eitherLoading = leftLoading || rightLoading;
 
   const allDiffs = useMemo(
-    () => computeDiff(data.data[leftVersion] ?? {}, data.data[rightVersion] ?? {}),
-    [data, leftVersion, rightVersion],
+    () => bothLoaded ? computeDiff(leftEntities, rightEntities) : [],
+    [leftEntities, rightEntities, bothLoaded],
   );
 
   const filteredDiffs = useMemo(() => {
@@ -98,30 +102,45 @@ export default function EntityDiffView({ data, onBack }: EntityDiffViewProps) {
         </div>
       </div>
 
-      {/* Diff cards */}
-      {leftVersion === rightVersion ? (
-        <div className="card p-8 text-center text-text-dim">
-          Select two different versions to compare.
-        </div>
-      ) : filteredDiffs.length === 0 ? (
-        <div className="card p-8 text-center text-text-dim">
-          {query ? 'No matching entities found.' : 'No differences between these versions.'}
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {filteredDiffs.map((diff) => (
-            <DiffCard
-              key={diff.name}
-              diff={diff}
-              leftVersion={leftVersion}
-              rightVersion={rightVersion}
-              hideIndexOnly={hideIndexOnly}
-            />
-          ))}
+      {/* Loading spinner */}
+      {eitherLoading && (
+        <div className="flex items-center justify-center py-12">
+          <div className="h-8 w-8 animate-spin rounded-full border-3 border-primary border-t-transparent" />
         </div>
       )}
 
-      <BackToTop />
+      {/* Diff cards */}
+      {!eitherLoading && (
+        <>
+          {leftVersion === rightVersion ? (
+            <div className="card p-8 text-center text-text-dim">
+              Select two different versions to compare.
+            </div>
+          ) : !bothLoaded ? (
+            <div className="card p-8 text-center text-text-dim">
+              Loading version data...
+            </div>
+          ) : filteredDiffs.length === 0 ? (
+            <div className="card p-8 text-center text-text-dim">
+              {query ? 'No matching entities found.' : 'No differences between these versions.'}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {filteredDiffs.map((diff) => (
+                <DiffCard
+                  key={diff.name}
+                  diff={diff}
+                  leftVersion={leftVersion}
+                  rightVersion={rightVersion}
+                  hideIndexOnly={hideIndexOnly}
+                />
+              ))}
+            </div>
+          )}
+
+          <BackToTop />
+        </>
+      )}
     </>
   );
 }
