@@ -102,4 +102,4 @@ else:
             handle(data, file_name)
 
 with open(OUTPUT_FILE, "w") as file:
-    json.dump(servers, file)
+    json.dump(servers, file, indent=2)

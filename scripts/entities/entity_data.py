@@ -12,6 +12,7 @@ class EntityData:
     field_name: str
     data_type: str
     index: int
+    default_value: Optional[str] = None
 
 
 @dataclass
@@ -28,7 +29,7 @@ def format_class_name(class_name: str) -> str:
 
 
 def generate_entity_table(entity_class: EntityClass) -> str:
-    cols = ['Index', 'Data Type', 'Field Name']
+    cols = ['Index', 'Data Type', 'Field Name', 'Default']
     col_widths = {col: len(col) for col in cols}
 
     # Calculate column widths
@@ -36,7 +37,8 @@ def generate_entity_table(entity_class: EntityClass) -> str:
         row = {
             'Index': str(field.index),
             'Data Type': html.escape(field.data_type),
-            'Field Name': field.field_name
+            'Field Name': field.field_name,
+            'Default': field.default_value or ''
         }
         for key, value in row.items():
             col_widths[key] = max(col_widths[key], len(value))
@@ -52,7 +54,8 @@ def generate_entity_table(entity_class: EntityClass) -> str:
         row = {
             'Index': str(field.index),
             'Data Type': data_type,
-            'Field Name': field.field_name
+            'Field Name': field.field_name,
+            'Default': field.default_value or ''
         }
         rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in cols) + " |")
 
@@ -102,6 +105,13 @@ class MinecraftEntityAnalyzer:
             re.DOTALL # Ignores line breaks
         )
 
+        # To find default values in define calls like: entityData.define(DATA_FLAGS_ID, (byte)0);
+        # or builder style: builder.define(DATA_FLAGS, (byte)0);
+        self.define_pattern = re.compile(
+            r'\.define\(\s*(?:\w+\.)*([A-Z_\d]+)\s*,\s*(.+?)\)\s*[;.]',
+            re.DOTALL
+        )
+
         # Make sure we handle nested classes, like Display subtypes
         self.class_pattern = re.compile(
             r'class\s+(\w+)(?:\s+extends\s+([\w.]+))?(?:\s+implements\s+[^{]+)?\s*{'
@@ -116,7 +126,14 @@ class MinecraftEntityAnalyzer:
         if not class_matches:
             return None
 
+        # Build a lookup of raw constant name -> default value from all define() calls
+        defaults = {}
+        for define_match in self.define_pattern.finditer(content):
+            const_name, default_val = define_match.groups()
+            defaults[const_name] = ' '.join(default_val.strip().split())
+
         entity_classes = []
+        used_defaults = set()
         for match in class_matches:
             class_name = match[0]
             super_class = match[1] if match[1] else None
@@ -128,6 +145,12 @@ class MinecraftEntityAnalyzer:
 
                 # Check for nested classes
                 if entity_class == class_name or entity_class.endswith(f".{class_name}"):
+                    # Look up default value by raw constant name before cleanup
+                    raw_name = field_name.strip()
+                    default_value = defaults.get(raw_name)
+                    if default_value is not None:
+                        used_defaults.add(raw_name)
+
                     # Clean up names slightly, though they will still be incredibly inconsistent
                     field_name = field_name.replace('DATA_ID_', '').replace('DATA_', '').replace('_ID', '')
                     data_type = data_type.strip()
@@ -136,8 +159,15 @@ class MinecraftEntityAnalyzer:
                     data_fields.append(EntityData(
                         field_name=field_name,
                         data_type=data_type,
-                        index=-1
+                        index=-1,
+                        default_value=default_value
                     ))
+
+            # Warn if some fields are missing defaults
+            if data_fields:
+                fields_with_defaults = sum(1 for f in data_fields if f.default_value is not None)
+                if fields_with_defaults != len(data_fields):
+                    print(f'Warning: {class_name} has {len(data_fields)} field(s) but {fields_with_defaults} default(s) detected ({os.path.basename(file_path)})')
 
             # Also prettify class names
             class_name = format_class_name(class_name)
@@ -150,6 +180,11 @@ class MinecraftEntityAnalyzer:
                 data_fields=data_fields,
                 file_path=file_path
             ))
+
+        # Warn about define() calls that didn't match any field definition
+        unused_defaults = set(defaults.keys()) - used_defaults
+        if unused_defaults:
+            print(f'Warning: {len(unused_defaults)} unmatched define() call(s) in {os.path.basename(file_path)}: {", ".join(sorted(unused_defaults))}')
 
         return entity_classes
 
@@ -228,14 +263,16 @@ class MinecraftEntityAnalyzer:
 
         entities = {}
         for entity_class in sorted_classes:
-            fields = [
-                {
+            fields = []
+            for field in entity_class.data_fields:
+                field_dict = {
                     "index": field.index,
                     "dataType": field.data_type,
                     "fieldName": field.field_name,
                 }
-                for field in entity_class.data_fields
-            ]
+                if field.default_value is not None:
+                    field_dict["defaultValue"] = field.default_value
+                fields.append(field_dict)
             entities[entity_class.name] = {
                 "superClass": entity_class.super_class if entity_class.super_class in self.entity_classes else entity_class.super_class,
                 "fields": fields,

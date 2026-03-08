@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import type { EntityDataJson } from '../_lib/entityDataUtils';
+import type { VersionEntities } from '../_lib/entityDataUtils';
 import { filterEntities, getInheritedFieldGroups } from '../_lib/entityDataUtils';
 import { getUrlParams, updateUrlParam, setUrlHash } from '../_lib/useUrlState';
 import VersionSelector from './VersionSelector';
@@ -11,32 +11,28 @@ import EntityTable from './EntityTable';
 import BackToTop from './BackToTop';
 
 interface EntityBrowseViewProps {
-  data: EntityDataJson;
+  versions: string[];
+  version: string;
+  entities: VersionEntities | null;
+  loading: boolean;
+  onVersionChange: (v: string) => void;
   onCompare: () => void;
 }
 
-export default function EntityBrowseView({ data, onCompare }: EntityBrowseViewProps) {
-  const versions = data.versions;
+export default function EntityBrowseView({ versions, version, entities, loading, onVersionChange, onCompare }: EntityBrowseViewProps) {
   const latestVersion = versions[versions.length - 1];
 
-  // Initialize from URL params
-  const [version, setVersionState] = useState(() => {
-    const param = getUrlParams().get('version');
-    return param && versions.includes(param) ? param : latestVersion;
-  });
   const [query, setQuery] = useState('');
   const [showInherited, setShowInherited] = useState(false);
   const hasScrolledToHash = useRef(false);
 
   const setVersion = useCallback((v: string) => {
-    setVersionState(v);
+    onVersionChange(v);
     updateUrlParam('version', v === latestVersion ? null : v);
-  }, [latestVersion]);
-
-  const entities = data.data[version] ?? {};
+  }, [latestVersion, onVersionChange]);
 
   const filteredNames = useMemo(
-    () => filterEntities(entities, query),
+    () => entities ? filterEntities(entities, query) : [],
     [entities, query],
   );
   const visibleSet = useMemo(() => new Set(filteredNames), [filteredNames]);
@@ -88,7 +84,7 @@ export default function EntityBrowseView({ data, onCompare }: EntityBrowseViewPr
           query={query}
           onChange={setQuery}
           resultCount={filteredNames.length}
-          totalCount={Object.keys(entities).length}
+          totalCount={entities ? Object.keys(entities).length : 0}
         />
 
         <label className="mt-3 flex items-center gap-2 text-sm text-text-muted cursor-pointer select-none w-fit">
@@ -102,37 +98,49 @@ export default function EntityBrowseView({ data, onCompare }: EntityBrowseViewPr
         </label>
       </div>
 
-      {/* Hierarchy navigator */}
-      <div className="mb-6">
-        <EntityNavigator
-          entities={entities}
-          query={query}
-          visibleEntities={visibleSet}
-          onEntityClick={scrollToEntity}
-          showInherited={showInherited}
-        />
-      </div>
-
-      {/* Entity tables */}
-      {filteredNames.length === 0 ? (
-        <div className="card p-8 text-center text-text-dim">
-          No entities match your search.
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {filteredNames.map((name) => (
-            <EntityTable
-              key={name}
-              name={name}
-              entity={entities[name]}
-              inheritedGroups={showInherited ? getInheritedFieldGroups(entities, name) : undefined}
-              onSuperClassClick={handleSuperClassClick}
-            />
-          ))}
+      {/* Loading spinner */}
+      {loading && (
+        <div className="flex items-center justify-center py-12">
+          <div className="h-8 w-8 animate-spin rounded-full border-3 border-primary border-t-transparent" />
         </div>
       )}
 
-      <BackToTop />
+      {/* Content (shown even while loading next version, but hidden if no data yet) */}
+      {!loading && entities && (
+        <>
+          {/* Hierarchy navigator */}
+          <div className="mb-6">
+            <EntityNavigator
+              entities={entities}
+              query={query}
+              visibleEntities={visibleSet}
+              onEntityClick={scrollToEntity}
+              showInherited={showInherited}
+            />
+          </div>
+
+          {/* Entity tables */}
+          {filteredNames.length === 0 ? (
+            <div className="card p-8 text-center text-text-dim">
+              No entities match your search.
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {filteredNames.map((name) => (
+                <EntityTable
+                  key={name}
+                  name={name}
+                  entity={entities[name]}
+                  inheritedGroups={showInherited ? getInheritedFieldGroups(entities, name) : undefined}
+                  onSuperClassClick={handleSuperClassClick}
+                />
+              ))}
+            </div>
+          )}
+
+          <BackToTop />
+        </>
+      )}
     </>
   );
 }
