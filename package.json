@@ -4,9 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "postbuild": "next-sitemap"
+    "build": "next build && next-sitemap",
+    "start": "next start"
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.1",
