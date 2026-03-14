@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import SocialLink from '@/components/ui/SocialLink';
 import { SOCIAL_LINKS } from '@/lib/constants';
 
@@ -21,6 +22,14 @@ export default function Footer() {
             />
           ))}
         </ul>
+        <div className="mt-4 flex justify-center gap-4 text-xs">
+          <Link href="/legal" className="text-text-dim hover:text-text-muted">
+            Legal Notice
+          </Link>
+          <Link href="/privacy" className="text-text-dim hover:text-text-muted">
+            Privacy Policy
+          </Link>
+        </div>
       </div>
     </footer>
   );
