@@ -3,7 +3,7 @@ import os
 import argutil
 
 MIN_VERSION = 8
-EXPAND_VERSIONS = ["1.21"]
+EXPAND_VERSIONS = ["26.1"]
 SOFTWARE_LIST = {
     "paper": True,
     "bukkit": False
