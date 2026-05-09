@@ -1,9 +1,10 @@
 import json
 import os
+import re
 import argutil
 
 MIN_VERSION = 8
-EXPAND_VERSIONS = ["26.1"]
+EXPAND_VERSIONS = []
 SOFTWARE_LIST = {
     "paper": True,
     "bukkit": False
@@ -11,27 +12,49 @@ SOFTWARE_LIST = {
 OUTPUT_FILE = os.path.join("public", "servers.json")
 TEMPLATE_FILE = os.path.join("public", "servers-template.json")
 
+# Old "1.x[.y]" or new year-prefixed "YY.x[.y]"
+VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?")
+
 
 def load_json(file_name):
     with open(file_name, "r") as f:
         return json.load(f)
 
 
+def parse_parent_version(version):
+    match = VERSION_PATTERN.match(version)
+    if not match:
+        return None
+    major, minor, _patch = match.groups()
+    return f"{major}.{minor}"
+
+
+def is_supported_version(version):
+    match = VERSION_PATTERN.match(version)
+    if not match:
+        return False
+    major = int(match.group(1))
+    return major == 1 or major >= 2
+
+
 def add_to_version_data(version, version_data, server_count):
-    # Collect 1.x.y as 1.x
-    separator_index = version.index(".", 2)
-    parent_version = version[0:separator_index]
-    try:
-        if int(parent_version[2:]) < MIN_VERSION:
+    parent_version = parse_parent_version(version)
+    if parent_version is None:
+        # Unknown, record as-is
+        version_data[version] = server_count
+        return
+
+    if parent_version.startswith("1."):
+        try:
+            if int(parent_version[2:]) < MIN_VERSION:
+                return
+        except ValueError:
+            # Ignore dumb version
             pass
-    except ValueError:
-        # Ignore dumb version
-        pass
 
     if parent_version in EXPAND_VERSIONS:
-        # Exempted
+        # Exempted: record the exact version too
         version_data[version] = server_count
-        pass
 
     if parent_version not in version_data:
         version_data[parent_version] = server_count
@@ -64,8 +87,8 @@ def handle(append_to, file_name, full=False):
                 version_data[version] = server_count
                 continue
 
-            # Ignore the custom garbage
-            if not version.startswith("1."):
+            # Ignore the custom garbage; accept old (1.x) and new (year-first) formats
+            if not is_supported_version(version):
                 continue
 
             try:
