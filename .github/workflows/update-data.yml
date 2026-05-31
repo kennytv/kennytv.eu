@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: "update-data"
@@ -43,3 +44,8 @@ jobs:
 
           git diff --cached --quiet || git commit -m "Update servers.json"
           git push
+
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy.yml --ref main
