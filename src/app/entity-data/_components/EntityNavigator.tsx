@@ -21,11 +21,19 @@ export default function EntityNavigator({
   onEntityClick,
   showInherited,
 }: EntityNavigatorProps) {
+  // With a single root entity the root level is just one chip — start inside it
+  const defaultPath = useMemo(() => {
+    const roots = Object.entries(entities)
+      .filter(([, info]) => !info.superClass || !entities[info.superClass])
+      .map(([name]) => name);
+    return roots.length === 1 && hasChildren(entities, roots[0]) ? roots : [];
+  }, [entities]);
+
   // Path represents the breadcrumb trail; empty = root level
-  const [path, setPath] = useState<string[]>([]);
+  const [path, setPath] = useState<string[]>(defaultPath);
 
   // Reset path when entities change (version switch)
-  useEffect(() => setPath([]), [entities]);
+  useEffect(() => setPath(defaultPath), [defaultPath]);
 
   const currentName = path.length > 0 ? path[path.length - 1] : null;
 
@@ -91,9 +99,9 @@ export default function EntityNavigator({
           <div className="mb-4 flex flex-wrap items-center gap-1 text-sm">
             <button
               type="button"
-              onClick={() => setPath([])}
+              onClick={() => setPath(defaultPath)}
               className={`rounded px-1.5 py-0.5 transition-colors ${
-                path.length === 0
+                path.length <= defaultPath.length
                   ? 'text-text font-medium'
                   : 'text-primary hover:text-primary-light'
               }`}

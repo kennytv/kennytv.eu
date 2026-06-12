@@ -38,8 +38,15 @@ export default function DiffCard({ diff, leftVersion, rightVersion, hideIndexOnl
         <StatusBadge status={diff.status} />
       </div>
 
-      {/* Super class change */}
-      {diff.leftSuperClass !== diff.rightSuperClass && (
+      {/* Super class (a plain line for added/removed entities, a change line otherwise) */}
+      {diff.status === 'added' || diff.status === 'removed' ? (
+        <p className="mb-2 text-xs text-text-dim">
+          Extends:{' '}
+          <span className="text-text-muted">
+            {(diff.status === 'added' ? diff.rightSuperClass : diff.leftSuperClass) ?? 'None'}
+          </span>
+        </p>
+      ) : diff.leftSuperClass !== diff.rightSuperClass && (
         <p className="mb-2 text-xs text-amber-400">
           Extends changed: {diff.leftSuperClass ?? 'None'} → {diff.rightSuperClass ?? 'None'}
         </p>

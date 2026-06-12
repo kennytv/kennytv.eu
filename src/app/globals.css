@@ -149,6 +149,16 @@ a:hover {
 
 
 
+/* Briefly outlines a card after jumping to it */
+.flash-highlight {
+  animation: flash-highlight 1.6s ease-out forwards;
+}
+
+@keyframes flash-highlight {
+  from { box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-primary) 80%, transparent); }
+  to { box-shadow: 0 0 0 2px transparent; }
+}
+
 .gradient-border-top {
   border-top: none;
   position: relative;

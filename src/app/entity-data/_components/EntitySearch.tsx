@@ -8,6 +8,7 @@ interface EntitySearchProps {
   onChange: (query: string) => void;
   resultCount: number;
   totalCount: number;
+  onSubmit?: () => void;
 }
 
 export default function EntitySearch({
@@ -15,6 +16,7 @@ export default function EntitySearch({
   onChange,
   resultCount,
   totalCount,
+  onSubmit,
 }: EntitySearchProps) {
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -46,6 +48,12 @@ export default function EntitySearch({
         type="text"
         value={query}
         onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            onSubmit?.();
+          }
+        }}
         placeholder="Search entities or fields..."
         className="w-full rounded-lg border border-border bg-bg-surface py-2.5 pl-10 pr-24
           text-sm text-text placeholder:text-text-dim
@@ -65,7 +73,7 @@ export default function EntitySearch({
       ) : (
         <kbd className="pointer-events-none absolute right-16 top-1/2 -translate-y-1/2
           rounded border border-border bg-bg-surface px-1.5 py-0.5 text-[10px]
-          font-mono text-text-dim leading-none">/</kbd>
+          font-mono text-text-dim leading-none pointer-coarse:hidden">/</kbd>
       )}
       <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-text-dim">
         {resultCount}/{totalCount}

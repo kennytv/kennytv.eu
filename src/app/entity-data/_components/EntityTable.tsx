@@ -16,7 +16,7 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
   const anchor = toAnchor(name);
 
   return (
-    <div id={anchor} className="card p-4 md:p-6">
+    <div id={anchor} className="card scroll-mt-4 p-4 md:scroll-mt-36 md:p-6">
       <h3 className="group mb-1 flex items-center gap-1.5 text-base font-semibold text-text">
         {name}
         <a
@@ -51,14 +51,14 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
                 <th className="py-2 pr-4 font-medium">Index</th>
                 <th className="py-2 pr-4 font-medium">Data Type</th>
                 <th className="py-2 pr-4 font-medium">Field Name</th>
-                <th className="py-2 font-medium">Default</th>
+                <th className="hidden py-2 font-medium sm:table-cell">Default</th>
               </tr>
             </thead>
             <tbody>
               {hasInherited &&
                 inheritedGroups!.map((group) =>
                   group.fields.map((field, i) => (
-                    <tr key={`${group.entityName}-${field.fieldName}`} className="border-b border-border/50">
+                    <tr key={`${group.entityName}-${field.fieldName}`} className="border-b border-border/50 transition-colors hover:bg-bg-card-hover">
                       <td className="py-1.5 pr-4 font-mono text-text-dim/60">{field.index}</td>
                       <td className="py-1.5 pr-4 font-mono text-amber/50">{field.dataType}</td>
                       <td className="py-1.5 pr-4 font-mono text-text-dim">
@@ -73,16 +73,24 @@ export default function EntityTable({ name, entity, inheritedGroups, onSuperClas
                           </button>
                         )}
                       </td>
-                      <td className="py-1.5 font-mono text-text-dim/60">{field.defaultValue ?? ''}</td>
+                      <td className="hidden py-1.5 font-mono text-text-dim/60 sm:table-cell">
+                        <span className="block max-w-56 truncate" title={field.defaultValue}>
+                          {field.defaultValue ?? ''}
+                        </span>
+                      </td>
                     </tr>
                   )),
                 )}
               {entity.fields.map((field) => (
-                <tr key={field.fieldName} className="border-b border-border/50">
+                <tr key={field.fieldName} className="border-b border-border/50 transition-colors hover:bg-bg-card-hover">
                   <td className="py-1.5 pr-4 font-mono text-text-muted">{field.index}</td>
                   <td className="py-1.5 pr-4 font-mono text-amber">{field.dataType}</td>
                   <td className="py-1.5 pr-4 font-mono text-text">{field.fieldName}</td>
-                  <td className="py-1.5 font-mono text-text-muted">{field.defaultValue ?? ''}</td>
+                  <td className="hidden py-1.5 font-mono text-text-muted sm:table-cell">
+                    <span className="block max-w-56 truncate" title={field.defaultValue}>
+                      {field.defaultValue ?? ''}
+                    </span>
+                  </td>
                 </tr>
               ))}
             </tbody>
