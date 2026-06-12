@@ -1,3 +1,5 @@
+import { Heart } from 'lucide-react';
+
 export default function HeroSection() {
   return (
     <section
@@ -9,7 +11,7 @@ export default function HeroSection() {
 
       <div className="container relative z-10">
         <div
-          className="mx-auto max-w-2xl opacity-0 animate-fade-in"
+          className="mx-auto max-w-2xl opacity-0 animate-fade-in motion-reduce:animate-none motion-reduce:opacity-100"
           style={{ animationDelay: '0.3s', animationFillMode: 'forwards' }}
         >
           {/* Main card */}
@@ -27,15 +29,16 @@ export default function HeroSection() {
           </div>
 
           {/* Sponsors card */}
-          <div className="hero-card overflow-hidden p-5 !bg-[#0d1117]">
-            <iframe
-              src="https://github.com/sponsors/kennytv/card"
-              title="Sponsor kennytv"
-              className="w-full h-[65px] border-0"
-              style={{ colorScheme: 'dark', background: 'var(--color-bg-card)' }}
-              loading="lazy"
-            />
-          </div>
+          <a
+            href="https://github.com/sponsors/kennytv"
+            target="_blank"
+            rel="noopener"
+            className="hero-card group flex items-center justify-center gap-2.5 p-4
+              !text-text-muted hover:!text-text transition-colors"
+          >
+            <Heart className="h-4 w-4 text-pink-400 transition-transform duration-300 group-hover:scale-125" />
+            <span className="text-sm font-medium">Sponsor kennytv on GitHub</span>
+          </a>
         </div>
       </div>
     </section>

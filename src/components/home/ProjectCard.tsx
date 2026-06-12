@@ -40,7 +40,7 @@ export default function ProjectCard({
 
   return (
     <div
-      className="opacity-0 animate-fade-in-up"
+      className="opacity-0 animate-fade-in-up motion-reduce:animate-none motion-reduce:opacity-100"
       style={{ animationDelay: `${delay}ms`, animationFillMode: 'forwards' }}
     >
       <div className="card p-5 group">
