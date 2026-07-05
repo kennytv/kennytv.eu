@@ -22,7 +22,7 @@ export default function PacketSearch({
         type="text"
         value={query}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="Search packets, fields, or types..."
+        placeholder="Search packets, fields, types, or an id (26, 0x1A)..."
         className="w-full rounded-lg border border-border bg-bg-surface py-2.5 pl-10 pr-20
           text-sm text-text placeholder:text-text-dim
           focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary

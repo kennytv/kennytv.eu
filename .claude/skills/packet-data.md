@@ -1,143 +1,43 @@
 # Packet Data
 
-Minecraft packet definition browser and cross-version diff tool at `/packet-data`. Parses decompiled Java source to extract packet definitions, fields, protocol registrations, and custom codec types.
+Minecraft packet wire-format browser and cross-version diff at `/packet-data`. Data is extracted by **running real game code** against the unobfuscated vanilla server jar — no decompiled source, no regex parsing.
 
-## Components (`src/app/packet-data/_components/`)
-
-- `PacketDataClient.tsx` — Top-level client component. Fetches `index.json`, caches per-version data, switches browse/diff mode.
-- `PacketBrowseView.tsx` — Browse mode. Version selector, search, packets grouped by protocol then direction (Clientbound/Serverbound).
-- `PacketDiffView.tsx` — Diff mode. Two version selectors, computes and displays packet diffs grouped by protocol/direction. "Hide index-only changes" toggle.
-- `PacketTable.tsx` — Single packet card. Shows name, hex index badge, field table. Type column links to base types section for custom codec types.
-- `PacketDiffCard.tsx` — Diff result card. Status badge (added/removed/changed), field-level diff with type change visualization.
-- `TypesSection.tsx` — Base types reference at bottom. Shows custom codec types with field tables. Dispatch types shown as "Polymorphic type (dispatch codec)".
-- `PacketSearch.tsx` — Search input with result count badge.
-- `VersionSelector.tsx` — Version dropdown.
-
-## Data Processing (`src/app/packet-data/_lib/`)
-
-- `packetDataUtils.ts` — Types (`PacketField`, `PacketInfo`, `CustomType`, `VersionPacketData`, `PacketDataIndex`), constants (`PROTOCOL_ORDER`, `DIRECTION_LABELS`, `PROTOCOL_LABELS`), search (`filterPackets`), diff computation (`computePacketDiff`, `diffPacketFields`, `filterPacketDiffs`), type reference helpers (`getReferencedType`).
-
-## Data
-
-- `public/packet-data/index.json` — `{ "versions": ["1.14.4", ...] }` listing all available versions
-- `public/packet-data/<version>.json` — Per-version packet data (one file per version, unlike entity data which is all-in-one)
-
-### Per-version JSON schema
-
-```json
-{
-  "packets": {
-    "PLAY": {
-      "CLIENTBOUND": [
-        { "name": "ClientboundAddEntityPacket", "index": 0, "fields": [
-          { "name": "id", "type": "VarInt" },
-          { "name": "uuid", "type": "UUID" }
-        ]}
-      ],
-      "SERVERBOUND": [...]
-    },
-    "CONFIGURATION": { ... },
-    "LOGIN": { ... },
-    "STATUS": { ... },
-    "HANDSHAKE": { ... }
-  },
-  "types": {
-    "Entry": { "fields": [{ "name": "itemId", "type": "VarInt" }] },
-    "RecipeDisplay": { "fields": [] }
-  }
-}
-```
-
-Fields may have an optional `"limit"` key (integer) for collection size limits. Types with empty `"fields"` are polymorphic dispatch codecs.
-
-## Data Generation (`scripts/packets/`)
-
-See `scripts.md` for the Python scripts that parse Minecraft source and produce the JSON data.
-
-### Packet Analyzer (`packet_data.py`)
-
-`MinecraftPacketAnalyzer` class with three codec parsing strategies:
-
-1. **`StreamCodec.composite(...)`** — Declarative field pairs `(codec, getter)`. Parsed via `_parse_composite_args` using `_split_top_level` for balanced delimiter splitting. Handles chained `.apply()` wrappers (optional, list, collection).
-2. **`Packet.codec(Writer::write, Reader::new)`** — Manual read/write methods. Parsed via `_parse_write_method` which scans `write()` body for `output.writeVarInt(this.x)` patterns, `SomeCodec.encode()` calls, and `ByteBufCodecs.registry().encode()` calls.
-3. **`StreamCodec.unit(INSTANCE)`** — Empty packets (no fields).
-4. **`.map(Class::new, Class::getter)`** — Single-field wrapper codec pattern.
-
-Type name cleaning (`_clean_type_name`):
-- `ByteBufCodecs.VAR_INT` → `VarInt`, `ByteBufCodecs.STRING_UTF8` → `String`, etc.
-- `SomeType.STREAM_CODEC` → `SomeType`
-- `.apply(ByteBufCodecs::optional)` → `Optional<...>`
-- `.apply(ByteBufCodecs.list(N))` → `List<...>` with limit N
-- Special mappings: `UUIDUtil` → `UUID`, `ComponentSerialization` → `Component`, `ParticleTypes` → `Particle`
-
-Protocol index assignment (`parse_protocol_file`):
-- Parses `GameProtocols.java`, `LoginProtocols.java`, etc.
-- Finds `clientboundProtocol`/`serverboundProtocol` method calls
-- Extracts `.addPacket()` / `.withBundlePacket()` calls in order — packet index = call order (0-indexed)
-- Uses balanced parenthesis matching to handle nested expressions
-
-Custom types:
-- Records with `StreamCodec.composite()` definitions
-- Interfaces/abstract classes with `.dispatch()` codecs (polymorphic types like `RecipeDisplay`, `SlotDisplay`)
-- Only types actually referenced by packet fields are included in output
-
-### Testing the analyzer
-
-Run from `scripts/packets/` against the MCSources checkout:
+## Regenerating data
 
 ```bash
-cd scripts/packets
-
-# Print JSON to stdout
-python packet_data.py
-
-# Generate a single version file
-python single_packet_data.py 26.1
-
-# Quick stats check
-python -c "
-import packet_data
-a = packet_data.analyze(packet_data.expanduser(packet_data.join('~','IdeaProjects','MCSources','src','main','java','net','minecraft')))
-d = a.generate_json()
-total = sum(len(p) for proto in d['packets'].values() for p in proto.values())
-with_fields = sum(1 for proto in d['packets'].values() for ps in proto.values() for p in ps if p['fields'])
-print(f'{total} packets, {with_fields} with fields, {len(d.get(\"types\", {}))} base types')
-for proto, dirs in d['packets'].items():
-    for direction, packets in dirs.items():
-        n = len(packets); nf = sum(1 for p in packets if p['fields'])
-        if n > 0: print(f'  {proto}/{direction}: {n} packets, {nf} with fields')
-"
-
-# Check all unique field type names
-python -c "
-import packet_data
-a = packet_data.analyze(packet_data.expanduser(packet_data.join('~','IdeaProjects','MCSources','src','main','java','net','minecraft')))
-d = a.generate_json()
-types = set()
-for proto in d['packets'].values():
-    for direction in proto.values():
-        for p in direction:
-            for f in p['fields']:
-                types.add(f['type'])
-for t in sorted(types): print(t)
-"
-
-# List packets with no fields (should mostly be StreamCodec.unit empty packets)
-python -c "
-import packet_data
-a = packet_data.analyze(packet_data.expanduser(packet_data.join('~','IdeaProjects','MCSources','src','main','java','net','minecraft')))
-d = a.generate_json()
-for proto, dirs in d['packets'].items():
-    for direction, packets in dirs.items():
-        for p in packets:
-            if not p['fields']:
-                print(f'{proto}/{direction}: {p[\"name\"]}')
-"
+python scripts/packets/generate.py <version|release|snapshot>   # add --pretty for readable JSON
 ```
 
-### Known limitations
+Downloads the server jar from piston-meta (cached in `scripts/packets/work/`, gitignored), unzips the bundler's embedded game jar + libraries, compiles the extractor against them (JDK 25+ on PATH), runs it, writes `public/packet-data/<version>.json` and updates `index.json`. Quality check: the final stderr line — **opaque count must be 0** (e.g. `256 packets, 164 shared types, 0 opaque`).
 
-- Packets with complex dispatch in `write()` (e.g. `ClientboundBossEventPacket` with inner `OperationType` enum) produce empty field lists
-- `writeCollection` / `writeOptional` / `writeMap` in write methods are detected but inner types are not resolved (shown as generic `Collection`, `Optional`, `Map`)
-- Some packets registered in multiple protocols (e.g. `ClientboundCookieRequestPacket` in LOGIN, CONFIGURATION, and PLAY) appear once per protocol section
-- The `write()` method parser requires the `final` keyword handling in the method signature (`void write(final FriendlyByteBuf output)`)
+Only unobfuscated-jar versions work (26.x era). Pre-obfuscation-removal versions are not supported.
+
+## Extractor (`scripts/packets/extractor/src/`)
+
+Four files, compiled per-run against the game jar:
+
+- `PacketExtractor.java` — main. Bootstraps the game, loads full registries (incl. data-driven via vanilla datapack), scans the jar for `PacketType` constants (→ packet classes via generic field signatures) and `StreamCodec` constants (→ identity labels like `ItemStack.STREAM_CODEC`). Packet ids/protocols come from reflecting the unbound protocol templates' captured `CodecEntry` lists (`val$codecs`) — same ground truth as vanilla's own packet report. Emits JSON via Gson. `--debug=<PacketClassSimpleName>` instead of an output path traces one packet with every policy and dumps events + stacks.
+- `ShapeRegistry.java` — learns the anonymous-class names of codec combinators by instantiating samples at startup, so codecs and stack frames are identified by exact class, not field-name heuristics.
+- `CodecWalker.java` — recursively interprets live `StreamCodec` objects: composite (field names/types from record components or constructor parameters — parameter names ship in the jar), optional/list/map/either/registry/holder/holderSet/idMapper (probed for enum values)/lengthPrefixed/parsedCodec. Dispatch codecs enumerate every registry/id key into `variants` (identical bodies merged). Labeled non-trivial codecs become entries in the shared `types` table, referenced via `ref` nodes. `specialCodec()` hand-models formats tracing can't express: ItemStack, DataComponentPatch (all component types enumerated via `type.streamCodec()`), set_entity_data / set_equipment / section_blocks_update (sentinel/bit-packed loops).
+- `DecodeTracer.java` — the universal fallback for `of`/`ofMember` (manual `write()/read()`) codecs: decodes against a `FabricatingByteBuf` (in `io/netty/buffer/`, extends `UnpooledHeapByteBuf`) that synthesizes bytes on demand and records a stack trace per read. Frames give nesting (constructor/reader frames become groups, known combinator frames become List/Map/Optional containers) and wire labels (`readVarInt` → VarInt etc., line numbers separate same-type reads). Fabrication policy: varints 1, booleans decay true→false per call site, NBT planted as `{text:"a"}` (falls back to empty compound), unique 2-char strings (field names recovered by matching markers in the decoded object graph), valid RSA key for `readPublicKey`, sentinel-loop breaker (3rd same-site byte → 0xFF). Branch exploration re-decodes with scripted values and diffs unit lists into prefix + variants + common tail: enums (`readEnum` ordinal), plain byte switches (0–4, e.g. team/objective `method`), EnumSet bits (player_info actions), registry-dispatch keys (particles; labeled via reverse registry lookup — must use `getResourceKey`, `getKey` answers defaults). Field naming tries: hierarchy fields positional → bucket queues (equal counts) → constructor params → order-preserving partial match, all guarded by wire↔type affinity vetoes (misnaming is worse than unnamed).
+
+Maintenance model: unknown new combinators degrade to tracing automatically (`[walker] tracing unknown shape` on stderr is informational). API renames in a new version fail the compile loudly — fix the few lines. The hand-modeled specials in `specialCodec()` must be revalidated if Mojang changes those encodings.
+
+## JSON schema
+
+`{version, protocolVersion, protocols: {handshake|status|login|configuration|play: {clientbound|serverbound: [{index, id, class, body}]}}, types: {name: node}}`
+
+Recursive node: `kind` ∈ `value` (leaf: `wire`), `container`/`traced` (`fields`), `group` (`context` + `fields`, from traced frames), `list`/`optional`/`prefixed` (`elem`/`inner`, counts/flags implied), `map` (`key`+`value`), `either`, `registry`/`holder`/`holderSet` (`registry` id; holder may have `direct`), `enum` (`values`), `dispatch` (`variants: [{key, body}]`, keys comma-merged when bodies match), `ref` (→ `types`), `unit` (empty), `opaque`. Optional keys anywhere: `name`, `java`, `note`, `limit`, `x` (repetition of merged fixed-size reads), `link`/`linkText` (related page), `partial`.
+
+## Frontend (`src/app/packet-data/`)
+
+- `_lib/packetDataUtils.ts` — types, recursive search, `flattenNode` + LCS `diffLines` for version diffing, anchors.
+- `_components/NodeTree.tsx` — recursive renderer; simple subtrees render inline (`Optional<UUID>`, `Map<K, V>`), complex ones as indented blocks; collapsible variants.
+- `PacketCard` / `TypesSection` — cards with hover `#` anchor links (hash navigation, browser back works).
+- `TypePanel.tsx` — side panel opened by type-ref clicks; breadcrumb trail for nested types.
+- `PacketBrowseView` / `PacketDiffView` / `PacketDataClient` — browse/search, line-level tree diff between versions, index/fetch plumbing.
+
+## Known limitations
+
+- Byte-flag conditionals inside traced packets show the maximal path, not per-flag variants (e.g. `add_entity.movement` LpVec3 shows only its header byte; set_objective's fields show under method "0, 2" but its nested number-format dispatch is a sampled path — nested explorations don't compose).
+- Traced dispatch/EnumSet variant bodies are named best-effort; ambiguous ones stay unnamed rather than guessing.

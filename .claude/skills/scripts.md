@@ -14,9 +14,8 @@
 
 ### Packet Data (`scripts/packets/`)
 
-- `packet_data.py` — `MinecraftPacketAnalyzer` class: parses Java source for packet definitions (`implements Packet<>`), extracts fields from `StreamCodec.composite()`, `Packet.codec()` write methods, and `StreamCodec.unit()`. Parses protocol registration files for packet indices. Detects custom codec types (composite records, dispatch interfaces). See `packet-data.md` for full details.
-- `all_packet_data.py` — Iterates release commits in a Minecraft source repo (skips snapshots), runs the analyzer at each, produces per-version JSON files in `public/packet-data/` with deduplication.
-- `single_packet_data.py` — Adds/updates a single version: writes `public/packet-data/<version>.json` and updates `public/packet-data/index.json`.
+- `generate.py` — Full pipeline for one version: downloads the unobfuscated vanilla server jar, unpacks the bundler, compiles `extractor/src/*.java` against the game jar (JDK 25+), runs it, writes `public/packet-data/<version>.json` + `index.json`. Usage: `python scripts/packets/generate.py <version|release|snapshot>`.
+- `extractor/src/` — Java extractor that runs real game code to produce exact wire formats. See `packet-data.md` for full details.
 
 ## GitHub Actions (`.github/workflows/`)
 
