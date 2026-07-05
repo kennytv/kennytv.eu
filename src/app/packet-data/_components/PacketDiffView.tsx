@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import type { VersionPacketData, PacketDiff } from '../_lib/packetDataUtils';
-import { computePacketDiff, filterPacketDiffs, PROTOCOL_LABELS, DIRECTION_LABELS } from '../_lib/packetDataUtils';
+import { computePacketDiff, filterPacketDiffs, PROTOCOL_LABELS, FLOW_LABELS } from '../_lib/packetDataUtils';
 import VersionSelector from './VersionSelector';
 import PacketSearch from './PacketSearch';
 import PacketDiffCard from './PacketDiffCard';
@@ -43,20 +43,21 @@ export default function PacketDiffView({ versions, fetchVersion, onBack }: Packe
     let diffs = filterPacketDiffs(allDiffs, query);
     diffs = diffs.filter((d) => d.status !== 'unchanged');
     if (hideIndexOnly) {
-      diffs = diffs.filter((d) => hasNonIndexChanges(d));
+      diffs = diffs.filter((d) => d.status !== 'changed' || d.lines.some((l) => l.status !== 'same'));
     }
     return diffs;
   }, [allDiffs, query, hideIndexOnly]);
 
   const changedCount = allDiffs.filter((d) => d.status !== 'unchanged').length;
-
-  // Group diffs by protocol > direction
-  const grouped = useMemo(() => groupDiffsByProtocol(filteredDiffs), [filteredDiffs]);
+  const grouped = useMemo(() => groupDiffs(filteredDiffs), [filteredDiffs]);
 
   return (
     <>
-      {/* Controls */}
-      <div className="card mb-6 p-4 md:p-6">
+      {/* Controls — sticky so search and version selection stay reachable while scrolling.
+          The wrapper carries the stickiness: .card sets position:relative, which
+          would override the sticky utility on the same element. */}
+      <div className="sticky top-2 z-30 mb-6">
+      <div className="card p-4 shadow-lg shadow-black/20 md:p-6">
         <div className="mb-4 flex flex-wrap items-center gap-4">
           <button
             type="button"
@@ -95,6 +96,7 @@ export default function PacketDiffView({ versions, fetchVersion, onBack }: Packe
           </span>
         </div>
       </div>
+      </div>
 
       {/* Diff results */}
       {loading ? (
@@ -111,19 +113,14 @@ export default function PacketDiffView({ versions, fetchVersion, onBack }: Packe
         </div>
       ) : (
         <div className="space-y-8">
-          {grouped.map(({ protocol, direction, diffs }) => (
-            <div key={`${protocol}-${direction}`}>
+          {grouped.map(({ protocol, flow, diffs }) => (
+            <div key={`${protocol}-${flow}`}>
               <h2 className="mb-3 text-sm font-medium text-text-dim uppercase tracking-wider">
-                {PROTOCOL_LABELS[protocol] ?? protocol} / {DIRECTION_LABELS[direction]}
+                {PROTOCOL_LABELS[protocol] ?? protocol} / {FLOW_LABELS[flow] ?? flow}
               </h2>
               <div className="space-y-4">
                 {diffs.map((diff) => (
-                  <PacketDiffCard
-                    key={diff.name}
-                    diff={diff}
-                    leftVersion={leftVersion}
-                    rightVersion={rightVersion}
-                  />
+                  <PacketDiffCard key={`${diff.protocol}-${diff.flow}-${diff.id}`} diff={diff} />
                 ))}
               </div>
             </div>
@@ -134,32 +131,21 @@ export default function PacketDiffView({ versions, fetchVersion, onBack }: Packe
   );
 }
 
-/** Check if a diff has any changes beyond pure index shifts */
-function hasNonIndexChanges(diff: PacketDiff): boolean {
-  if (diff.status === 'added' || diff.status === 'removed') return true;
-  return diff.fields.some((f) => f.status !== 'unchanged');
-}
-
 interface GroupedDiff {
   protocol: string;
-  direction: 'CLIENTBOUND' | 'SERVERBOUND';
+  flow: string;
   diffs: PacketDiff[];
 }
 
-function groupDiffsByProtocol(diffs: PacketDiff[]): GroupedDiff[] {
-  const map = new Map<string, PacketDiff[]>();
-
-  for (const diff of diffs) {
-    const key = `${diff.protocol}-${diff.direction}`;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key)!.push(diff);
-  }
-
+function groupDiffs(diffs: PacketDiff[]): GroupedDiff[] {
   const result: GroupedDiff[] = [];
-  for (const [key, groupDiffs] of map) {
-    const [protocol, direction] = key.split('-') as [string, 'CLIENTBOUND' | 'SERVERBOUND'];
-    result.push({ protocol, direction, diffs: groupDiffs });
+  for (const diff of diffs) {
+    let group = result.find((g) => g.protocol === diff.protocol && g.flow === diff.flow);
+    if (!group) {
+      group = { protocol: diff.protocol, flow: diff.flow, diffs: [] };
+      result.push(group);
+    }
+    group.diffs.push(diff);
   }
-
   return result;
 }
