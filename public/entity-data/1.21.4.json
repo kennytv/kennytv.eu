@@ -789,7 +789,7 @@
         "index": 8,
         "dataType": "Holder<PaintingVariant>",
         "fieldName": "PAINTING_VARIANT",
-        "defaultValue": "this.registryAccess("
+        "defaultValue": "this.registryAccess().lookupOrThrow(Registries.PAINTING_VARIANT).getAny().orElseThrow()"
       }
     ]
   },
@@ -1981,7 +1981,7 @@
         "index": 22,
         "dataType": "Holder<WolfVariant>",
         "fieldName": "VARIANT",
-        "defaultValue": "var1x.get(WolfVariants.DEFAULT"
+        "defaultValue": "var1x.get(WolfVariants.DEFAULT).or(var1x::getAny).orElseThrow()"
       }
     ]
   },

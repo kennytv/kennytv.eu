@@ -1998,7 +1998,7 @@
         "index": 23,
         "dataType": "Holder<WolfSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "var0.get(WolfSoundVariants.CLASSIC"
+        "defaultValue": "var0.get(WolfSoundVariants.CLASSIC).or(var0::getAny).orElseThrow()"
       }
     ]
   },
