@@ -64,30 +64,24 @@ def generate_entity_table(entity_class: EntityClass) -> str:
 
 def generate_overview_tree(sorted_classes: List[EntityClass]) -> str:
     # Create an ugly "tree"
-    tree = {}
+    class_names = {entity_class.name for entity_class in sorted_classes}
+    children = {}
     for entity_class in sorted_classes:
-        if entity_class.super_class:
-            if entity_class.super_class not in tree:
-                tree[entity_class.super_class] = []
-            tree[entity_class.super_class].append(entity_class.name)
-        else:
-            if entity_class.name not in tree:
-                tree[entity_class.name] = []
+        if entity_class.super_class in class_names:
+            children.setdefault(entity_class.super_class, []).append(entity_class.name)
 
     # Function to recursively build the table
     def build_tree_table(class_name: str, indent: str) -> List[str]:
-        rows = []
-        if class_name in tree:
-            rows.append(f"{indent}- [{class_name}](#{class_name.lower().replace(' ', '-')})")
-            for subclass in tree[class_name]:
-                rows.extend(build_tree_table(subclass, indent + "  "))
+        rows = [f"{indent}- [{class_name}](#{class_name.lower().replace(' ', '-')})"]
+        for subclass in children.get(class_name, []):
+            rows.extend(build_tree_table(subclass, indent + "  "))
         return rows
 
-    # Generate the table from the tree
+    # Generate the table from the tree; top-level classes are those whose superclass wasn't parsed
     rows = []
-    for class_name in tree:
-        if not any(class_name in subclasses for subclasses in tree.values()):  # Only top-level classes
-            rows.extend(build_tree_table(class_name, ""))
+    for entity_class in sorted_classes:
+        if entity_class.super_class not in class_names:
+            rows.extend(build_tree_table(entity_class.name, ""))
 
     return "\n".join(rows)
 
@@ -107,15 +101,45 @@ class MinecraftEntityAnalyzer:
 
         # To find default values in define calls like: entityData.define(DATA_FLAGS_ID, (byte)0);
         # or builder style: builder.define(DATA_FLAGS, (byte)0);
+        # The value is scanned separately with paren balancing, since it may contain nested calls
         self.define_pattern = re.compile(
-            r'\.define\(\s*(?:\w+\.)*([A-Z_\d]+)\s*,\s*(.+?)\)\s*[;.]',
-            re.DOTALL
+            r'\.define\(\s*(?:\w+\.)*([A-Z_\d]+)\s*,\s*'
         )
 
-        # Make sure we handle nested classes, like Display subtypes
+        # Make sure we handle nested classes, like Display subtypes, and generic declarations
+        # like: class Foo<T extends Comparable<T>> extends Bar<T> implements Baz<T>
+        generics = r'<(?:[^<>]|<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)*>'
         self.class_pattern = re.compile(
-            r'class\s+(\w+)(?:\s+extends\s+([\w.]+))?(?:\s+implements\s+[^{]+)?\s*{'
+            r'class\s+(\w+)\s*(?:' + generics + r')?'
+            r'(?:\s+extends\s+([\w.]+)\s*(?:' + generics + r')?)?'
+            r'(?:\s+implements\s+[^{]+)?\s*{'
         )
+
+    @staticmethod
+    def extract_define_value(content: str, start: int) -> Optional[str]:
+        """Extract the value argument of a define() call, starting right after the comma.
+
+        Scans with paren balancing (skipping string/char literals) until the call's closing paren.
+        """
+        depth = 1
+        i = start
+        while i < len(content):
+            c = content[i]
+            if c in '"\'':
+                quote = c
+                i += 1
+                while i < len(content) and content[i] != quote:
+                    if content[i] == '\\':
+                        i += 1
+                    i += 1
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return content[start:i]
+            i += 1
+        return None
 
     def parse_java_file(self, file_path: str) -> Optional[List[EntityClass]]:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -129,8 +153,15 @@ class MinecraftEntityAnalyzer:
         # Build a lookup of raw constant name -> default value from all define() calls
         defaults = {}
         for define_match in self.define_pattern.finditer(content):
-            const_name, default_val = define_match.groups()
+            const_name = define_match.group(1)
+            default_val = self.extract_define_value(content, define_match.end())
+            if default_val is None:
+                print(f'Warning: unbalanced define() call for {const_name} in {os.path.basename(file_path)}')
+                continue
             defaults[const_name] = ' '.join(default_val.strip().split())
+
+        data_matches = list(self.data_pattern.finditer(content))
+        attributed = [False] * len(data_matches)
 
         entity_classes = []
         used_defaults = set()
@@ -140,11 +171,12 @@ class MinecraftEntityAnalyzer:
 
             # Find all entity data definitions for the class
             data_fields = []
-            for data_match in self.data_pattern.finditer(content):
+            for match_index, data_match in enumerate(data_matches):
                 data_type, field_name, entity_class, serializer = data_match.groups()
 
                 # Check for nested classes
                 if entity_class == class_name or entity_class.endswith(f".{class_name}"):
+                    attributed[match_index] = True
                     # Look up default value by raw constant name before cleanup
                     raw_name = field_name.strip()
                     default_value = defaults.get(raw_name)
@@ -185,6 +217,11 @@ class MinecraftEntityAnalyzer:
         unused_defaults = set(defaults.keys()) - used_defaults
         if unused_defaults:
             print(f'Warning: {len(unused_defaults)} unmatched define() call(s) in {os.path.basename(file_path)}: {", ".join(sorted(unused_defaults))}')
+
+        # Warn about data fields that no parsed class claimed (e.g. an unparsed class declaration)
+        unattributed = [data_matches[i].group(2) for i in range(len(data_matches)) if not attributed[i]]
+        if unattributed:
+            print(f'Warning: {len(unattributed)} data field(s) not attributed to any class in {os.path.basename(file_path)}: {", ".join(unattributed)}')
 
         return entity_classes
 
@@ -274,7 +311,7 @@ class MinecraftEntityAnalyzer:
                     field_dict["defaultValue"] = field.default_value
                 fields.append(field_dict)
             entities[entity_class.name] = {
-                "superClass": entity_class.super_class if entity_class.super_class in self.entity_classes else entity_class.super_class,
+                "superClass": entity_class.super_class,
                 "fields": fields,
             }
 

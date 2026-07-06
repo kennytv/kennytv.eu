@@ -1454,7 +1454,7 @@
         "index": 19,
         "dataType": "Holder<ChickenSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "chickenSoundVariants.get(ChickenSoundVariants.CLASSIC"
+        "defaultValue": "chickenSoundVariants.get(ChickenSoundVariants.CLASSIC).or(chickenSoundVariants::getAny).orElseThrow()"
       }
     ]
   },
@@ -1663,7 +1663,7 @@
         "index": 20,
         "dataType": "Holder<PigSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "pigSoundVariants.get(PigSoundVariants.CLASSIC"
+        "defaultValue": "pigSoundVariants.get(PigSoundVariants.CLASSIC).or(pigSoundVariants::getAny).orElseThrow()"
       }
     ]
   },
@@ -1994,7 +1994,7 @@
         "index": 24,
         "dataType": "Holder<CatSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "catSoundVariants.get(CatSoundVariants.CLASSIC"
+        "defaultValue": "catSoundVariants.get(CatSoundVariants.CLASSIC).or(catSoundVariants::getAny).orElseThrow()"
       }
     ]
   },
@@ -2015,7 +2015,7 @@
         "index": 19,
         "dataType": "Holder<CowSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "cowSoundVariants.get(CowSoundVariants.CLASSIC"
+        "defaultValue": "cowSoundVariants.get(CowSoundVariants.CLASSIC).or(cowSoundVariants::getAny).orElseThrow()"
       }
     ]
   },
@@ -2128,7 +2128,7 @@
         "index": 24,
         "dataType": "Holder<WolfSoundVariant>",
         "fieldName": "SOUND_VARIANT",
-        "defaultValue": "wolfSoundVariants.get(WolfSoundVariants.CLASSIC"
+        "defaultValue": "wolfSoundVariants.get(WolfSoundVariants.CLASSIC).or(wolfSoundVariants::getAny).orElseThrow()"
       }
     ]
   },

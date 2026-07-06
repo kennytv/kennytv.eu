@@ -1921,7 +1921,7 @@
         "index": 22,
         "dataType": "Holder<WolfVariant>",
         "fieldName": "VARIANT",
-        "defaultValue": "this.registryAccess("
+        "defaultValue": "this.registryAccess().registryOrThrow(Registries.WOLF_VARIANT).getHolderOrThrow(WolfVariants.PALE)"
       }
     ]
   },
