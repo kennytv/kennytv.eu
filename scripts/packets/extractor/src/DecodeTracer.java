@@ -494,7 +494,7 @@ public class DecodeTracer {
         String[] labels = labeling != null && labeling.enumClass() != null ? labeling.labels() : keys;
         List<Object> variants = buildVariantBodies(unitLists, prefix, tail, outs,
                 new VariantLabeling(labels, labeling != null ? labeling.enumClass() : null,
-                        labeling != null ? labeling.fieldName() : null, labeling != null ? labeling.field() : null));
+                        labeling != null ? labeling.fieldName() : null, labeling != null ? labeling.field() : null), true);
         if (variants == null) return null;
 
         Map<String, Object> dispatch = new LinkedHashMap<>();
@@ -509,7 +509,7 @@ public class DecodeTracer {
         // the dispatch belongs inside the list element, after the shared element prefix.
         Map<String, Object> host = rootFields.isEmpty() ? null : asMap(rootFields.getLast());
         boolean folded = host != null && "list".equals(host.get("kind")) && unwrapElementLists(variants);
-        stripPrefixNames(rootFields, variants);
+        stripPrefixNames(rootFields, variants, labeling != null ? labeling.fieldName() : null);
         if (folded) {
             List<Object> elemFields = new ArrayList<>();
             Map<String, Object> elem = asMap(host.get("elem"));
@@ -526,33 +526,58 @@ public class DecodeTracer {
         } else {
             rootFields.add(dispatch);
         }
-        appendTail(rootFields, unitLists.getFirst(), tail);
+        appendTail(rootFields, unitLists.getFirst(), tail, produced);
         return root;
     }
 
     /**
-     * A field name can only appear once in a packet: a top-level variant-body field named
-     * like a prefix field was matched against a field the prefix already consumed (the
-     * nested packet-class group naming its sole child "actions") — drop those names.
+     * A field name can only appear once in a packet: a variant-body node named like a field
+     * the prefix already consumed got its name from a garbage assignment — and so did its
+     * siblings from the same matching run, so the whole fields list is cleared. The
+     * switched-on field's own name is exempt: the variant value group legitimately shares
+     * it with the prefix key row (boss_event's operation, level_particles' particle).
      */
-    @SuppressWarnings("unchecked")
-    static void stripPrefixNames(List<Object> prefixFields, List<Object> variants) {
+    static void stripPrefixNames(List<Object> prefixFields, List<Object> variants, String switchedField) {
         java.util.Set<Object> taken = new java.util.HashSet<>();
         for (Object f : prefixFields) {
             Object name = asMap(f) == null ? null : asMap(f).get("name");
-            if (name != null) taken.add(name);
+            if (name != null && !name.equals(switchedField)) taken.add(name);
         }
         if (taken.isEmpty()) return;
         for (Object v : variants) {
             Map<String, Object> body = asMap(asMap(v).get("body"));
-            if (body == null || !(body.get("fields") instanceof List<?> fields)) continue;
-            for (Object f : fields) {
-                Map<String, Object> node = asMap(f);
-                if (node != null && taken.contains(node.get("name"))) {
-                    node.remove("name");
-                    node.remove("java");
-                    node.remove("values");
+            if (body != null) stripTakenNames(body, taken);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    static void stripTakenNames(Map<String, Object> node, java.util.Set<Object> taken) {
+        if (node.get("fields") instanceof List<?> l) {
+            boolean collided = false;
+            for (Object f : l) {
+                Map<String, Object> child = asMap(f);
+                if (child != null && taken.contains(child.get("name"))) {
+                    collided = true;
+                    break;
                 }
+            }
+            for (Object f : l) {
+                Map<String, Object> child = asMap(f);
+                if (child == null) continue;
+                if (collided) {
+                    child.remove("name");
+                    child.remove("java");
+                    child.remove("values");
+                }
+                stripTakenNames(child, taken);
+            }
+        }
+        for (String key : new String[]{"inner", "elem", "key", "value", "left", "right", "direct", "body"}) {
+            if (node.get(key) instanceof Map<?, ?> m) stripTakenNames((Map<String, Object>) m, taken);
+        }
+        if (node.get("variants") instanceof List<?> vl) {
+            for (Object v : vl) {
+                if (v instanceof Map<?, ?> m) stripTakenNames((Map<String, Object>) m, taken);
             }
         }
     }
@@ -596,7 +621,7 @@ public class DecodeTracer {
 
         Map<String, Object> root = treeFromUnits(unitLists.getFirst().subList(0, prefix), produced);
         VariantLabeling labeling = variantLabels(outs);
-        List<Object> variants = buildVariantBodies(unitLists, prefix, tail, outs, labeling);
+        List<Object> variants = buildVariantBodies(unitLists, prefix, tail, outs, labeling, true);
         if (variants == null) return null; // no switched body / all identical
 
         @SuppressWarnings("unchecked")
@@ -615,6 +640,8 @@ public class DecodeTracer {
             }
         }
 
+        stripPrefixNames(rootFields, variants, labeling != null ? labeling.fieldName() : null);
+
         Map<String, Object> dispatch = new LinkedHashMap<>();
         dispatch.put("kind", "dispatch");
         dispatch.put("note", labeling != null && labeling.fieldName() != null
@@ -622,17 +649,66 @@ public class DecodeTracer {
                 : "switch on the preceding enum");
         dispatch.put("variants", variants);
         rootFields.add(dispatch);
-        appendTail(rootFields, unitLists.getFirst(), tail);
+        appendTail(rootFields, unitLists.getFirst(), tail, produced);
         return root;
     }
 
     /** Common trailing units across all variants continue after the dispatch at top level. */
-    static void appendTail(List<Object> rootFields, List<Unit> units, int tail) {
+    @SuppressWarnings("unchecked")
+    static void appendTail(List<Object> rootFields, List<Unit> units, int tail, Class<?> produced) {
         if (tail <= 0) return;
         Map<String, Object> tailTree = treeFromUnits(units.subList(units.size() - tail, units.size()), null);
         if (tailTree.get("fields") instanceof List<?> l) {
+            nameTailByFieldType((List<Object>) l, rootFields, produced);
             for (Object field : l) rootFields.add(field);
         }
+    }
+
+    /**
+     * A multi-read tail with no naming context is usually one remaining packet field decoded
+     * by an inline composite (player_chat's trailing ChatType.Bound): when exactly one
+     * still-unclaimed field's type names every tail node, adopt that type's field names.
+     */
+    static void nameTailByFieldType(List<Object> tailNodes, List<Object> prefixFields, Class<?> produced) {
+        if (produced == null || tailNodes.size() < 2 || hasAnyName(tailNodes)) return;
+        java.util.Set<Object> claimed = new java.util.HashSet<>();
+        for (Object f : prefixFields) {
+            Map<String, Object> node = asMap(f);
+            if (node != null && node.get("name") != null) claimed.add(node.get("name"));
+        }
+        Class<?> match = null;
+        for (Field f : instanceFields(produced)) {
+            if (claimed.contains(f.getName()) || !fullNameMatch(tailNodes, f.getType())) continue;
+            if (match != null) return; // ambiguous
+            match = f.getType();
+        }
+        if (match != null) nameChildren(tailNodes, match);
+    }
+
+    /** Whether naming against this class assigns a name to every node (checked on a copy). */
+    static boolean fullNameMatch(List<Object> nodes, Class<?> cls) {
+        List<Object> copy = new ArrayList<>();
+        for (Object n : nodes) copy.add(copyTree(n));
+        nameChildren(copy, cls);
+        for (Object n : copy) {
+            if (asMap(n) == null || asMap(n).get("name") == null) return false;
+        }
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    static Object copyTree(Object value) {
+        if (value instanceof Map<?, ?> m) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            for (var e : ((Map<String, Object>) m).entrySet()) out.put(e.getKey(), copyTree(e.getValue()));
+            return out;
+        }
+        if (value instanceof List<?> l) {
+            List<Object> out = new ArrayList<>();
+            for (Object o : l) out.add(copyTree(o));
+            return out;
+        }
+        return value;
     }
 
     static int commonSuffix(List<List<Unit>> unitLists, int prefix) {
@@ -658,7 +734,8 @@ public class DecodeTracer {
      * distinguishes the variant (e.g. DustParticleOptions). Null when no variant has a body
      * or all bodies are identical (no real branching).
      */
-    static List<Object> buildVariantBodies(List<List<Unit>> unitLists, int prefix, int tail, List<TraceOutcome> outs, VariantLabeling labeling) {
+    static List<Object> buildVariantBodies(List<List<Unit>> unitLists, int prefix, int tail, List<TraceOutcome> outs,
+                                           VariantLabeling labeling, boolean packetReads) {
         List<Object> variants = new ArrayList<>();
         boolean anyBody = false;
         for (int i = 0; i < unitLists.size(); i++) {
@@ -677,8 +754,18 @@ public class DecodeTracer {
                     if (soleGroup != null) {
                         if (value.fieldName() != null) soleGroup.putIfAbsent("name", value.fieldName());
                         soleGroup.putIfAbsent("java", value.cls().getSimpleName());
-                        if (soleGroup.get("fields") instanceof List<?> groupFields) {
+                        // a Dispatch group's children are the key and the dispatched body,
+                        // not the value's fields — matching them fabricates names
+                        if (!"Dispatch".equals(soleGroup.get("context"))
+                                && soleGroup.get("fields") instanceof List<?> groupFields) {
                             nameChildren((List<Object>) groupFields, value.cls());
+                        }
+                        // reads next to the value group belong to the value class first
+                        // (vibration's arrivalInTicks), else — for switches the packet
+                        // itself decodes — to the packet (set_player_team's players)
+                        if (!nameUnclaimedVariantFields(fields, value.cls(), soleGroup) && packetReads) {
+                            Class<?> packetClass = outs.get(i).result() == null ? null : outs.get(i).result().getClass();
+                            nameUnclaimedVariantFields(fields, packetClass, null);
                         }
                     } else {
                         nameChildren(fields, value.cls());
@@ -714,6 +801,38 @@ public class DecodeTracer {
             if (f instanceof Map<?, ?> m && m.get("name") != null) return true;
         }
         return false;
+    }
+
+    /**
+     * Names a variant body's still-unnamed reads against the given class's fields that no
+     * named node claimed yet; names inside {@code alsoClaimed} count as taken too.
+     * Returns whether names were assigned.
+     */
+    static boolean nameUnclaimedVariantFields(List<Object> fields, Class<?> cls, Map<String, Object> alsoClaimed) {
+        if (cls == null) return false;
+        List<Object> unnamed = new ArrayList<>();
+        java.util.Set<Object> claimed = new java.util.HashSet<>();
+        for (Object f : fields) {
+            Map<String, Object> node = asMap(f);
+            if (node == null) continue;
+            if (node.get("name") != null) claimed.add(node.get("name"));
+            else unnamed.add(f);
+        }
+        if (alsoClaimed != null && alsoClaimed.get("fields") instanceof List<?> l) {
+            for (Object f : l) {
+                Map<String, Object> node = asMap(f);
+                if (node != null && node.get("name") != null) claimed.add(node.get("name"));
+            }
+        }
+        if (unnamed.isEmpty()) return false;
+        List<Field> open = new ArrayList<>();
+        for (Field f : instanceFields(cls)) {
+            if (!claimed.contains(f.getName())) open.add(f);
+        }
+        List<Field> match = uniqueAffinityMatch(unnamed, open, false);
+        if (match == null) return false;
+        applyNames(unnamed, match);
+        return true;
     }
 
     record VariantValue(Class<?> cls, String fieldName) {}
@@ -800,7 +919,8 @@ public class DecodeTracer {
 
         Map<String, Object> root = treeFromUnits(unitLists.getFirst().subList(0, prefix), produced);
         VariantLabeling labeling = dispatchLabels(outs);
-        List<Object> variants = buildVariantBodies(unitLists, prefix, tail, outs, labeling);
+        // registry-dispatch bodies decode the dispatched value only — never packet fields
+        List<Object> variants = buildVariantBodies(unitLists, prefix, tail, outs, labeling, false);
         if (variants == null) return null;
 
         Map<String, Object> dispatch = new LinkedHashMap<>();
@@ -809,6 +929,7 @@ public class DecodeTracer {
         dispatch.put("variants", variants);
         @SuppressWarnings("unchecked")
         List<Object> rootFields = (List<Object>) root.get("fields");
+        stripPrefixNames(rootFields, variants, labeling != null ? labeling.fieldName() : null);
 
         // If the key sits inside an optional (Optional<NumberFormat> etc.), keep the
         // dispatch inside it rather than as a detached sibling.
@@ -826,7 +947,7 @@ public class DecodeTracer {
         } else {
             rootFields.add(dispatch);
         }
-        appendTail(rootFields, unitLists.getFirst(), tail);
+        appendTail(rootFields, unitLists.getFirst(), tail, produced);
         return root;
     }
 
@@ -987,7 +1108,7 @@ public class DecodeTracer {
                         label = e.name();
                         enumClass = e.getDeclaringClass();
                     } else {
-                        label = v == null ? "null" : v.getClass().getSimpleName();
+                        label = v == null ? "null" : classLabel(v);
                     }
                     if (label.isEmpty()) label = "case " + i;
                     labels[i] = label;
@@ -1001,7 +1122,40 @@ public class DecodeTracer {
             } catch (Throwable ignored) {
             }
         }
+        if (byClass == null) {
+            // subclass-per-variant packets (TrackedWaypoint): the decoded objects' own
+            // classes label the variants when no single field distinguishes them
+            String[] labels = new String[outs.size()];
+            java.util.Set<String> distinct = new java.util.HashSet<>();
+            for (int i = 0; i < outs.size(); i++) {
+                Object r = outs.get(i).result();
+                if (r == null || (labels[i] = classLabel(r)).isEmpty()) return null;
+                distinct.add(labels[i]);
+            }
+            if (distinct.size() == outs.size()) return new VariantLabeling(labels, null, null, null);
+        }
         return byClass;
+    }
+
+    /**
+     * A value's display label: its class name, except anonymous singletons (boss_event's
+     * REMOVE_OPERATION) have none — probe a no-arg enum accessor (getType) for a constant.
+     */
+    static String classLabel(Object value) {
+        String simple = value.getClass().getSimpleName();
+        if (!simple.isEmpty()) return simple;
+        for (java.lang.reflect.Method m : value.getClass().getMethods()) {
+            if (m.getParameterCount() != 0 || !m.getReturnType().isEnum()
+                    || !m.getDeclaringClass().getName().startsWith("net.minecraft")) {
+                continue;
+            }
+            try {
+                m.setAccessible(true);
+                if (m.invoke(value) instanceof Enum<?> e) return e.name();
+            } catch (Throwable ignored) {
+            }
+        }
+        return simple;
     }
 
     /** The single enum among an object's fields (e.g. FilterMask.type), if any. */
@@ -1021,6 +1175,278 @@ public class DecodeTracer {
             }
         }
         return found;
+    }
+
+    /* ── hand patches ───────────────────────────────────── */
+
+    /**
+     * Targeted fixes for flag/conditional reads whose meaning tracing cannot recover: the
+     * fabricated buffer answers flag reads with 0, hiding fields behind flag bits, and
+     * packed bytes have no matching Java field to name them. Misses are reported loudly so
+     * a format change in a future version surfaces during generation.
+     */
+    static void applyHandPatches(Map<String, Object> tree, Class<?> produced) {
+        if (produced == null) return;
+        switch (PacketExtractor.nestedName(produced)) {
+            case "ClientboundUpdateAdvancementsPacket" -> patchDisplayInfo(tree);
+            case "ClientboundBossEventPacket" -> patchFlagBytes(tree, 2,
+                    "bit 1: darken screen, bit 2: play boss music, bit 4: create world fog");
+            case "ServerboundSetStructureBlockPacket" -> patchStructureBlock(tree);
+            case "ServerboundMovePlayerPacket.Pos", "ServerboundMovePlayerPacket.PosRot",
+                 "ServerboundMovePlayerPacket.Rot", "ServerboundMovePlayerPacket.StatusOnly" ->
+                    patchFlagByte(tree, "bit 1: on ground, bit 2: horizontal collision");
+            case "ServerboundSetCommandBlockPacket" ->
+                    patchFlagByte(tree, "bit 1: track output, bit 2: conditional, bit 4: automatic");
+            case "ClientboundPlayerAbilitiesPacket" ->
+                    patchFlagByte(tree, "bit 1: invulnerable, bit 2: flying, bit 4: may fly, bit 8: instabuild (creative)");
+            case "ServerboundPlayerAbilitiesPacket" ->
+                    patchFlagByte(tree, "bit 2: flying; other bits are ignored");
+            case "ClientboundDamageEventPacket" -> patchDamageEvent(tree);
+            case "ClientboundCustomQueryPacket" -> patchCustomQuery(tree);
+            case "ClientboundPlayerInfoUpdatePacket" -> patchPlayerInfo(tree);
+            case "DiscardedPayload" -> patchDiscardedPayload(tree);
+            case "ClientboundSetObjectivePacket" -> patchNumberFormat(tree);
+            default -> { }
+        }
+    }
+
+    /** player_info_update ADD_PLAYER: the game profile's name and property list. */
+    @SuppressWarnings("unchecked")
+    static void patchPlayerInfo(Map<String, Object> tree) {
+        boolean[] done = {false};
+        forEachNode(tree, n -> {
+            if (!"group".equals(n.get("kind"))
+                    || !"ClientboundPlayerInfoUpdatePacket$Action".equals(n.get("context"))
+                    || !(n.get("fields") instanceof List<?> l) || l.size() != 2) {
+                return;
+            }
+            Map<String, Object> name = asMap(l.get(0));
+            Map<String, Object> properties = asMap(l.get(1));
+            if (name == null || !"String".equals(name.get("wire"))
+                    || properties == null || !"list".equals(properties.get("kind"))) {
+                return;
+            }
+            name.put("name", "name");
+            properties.put("name", "properties");
+            Map<String, Object> elem = asMap(properties.get("elem"));
+            if (elem != null && elem.get("fields") instanceof List<?> el && el.size() == 3) {
+                asMap(el.get(0)).put("name", "name");
+                asMap(el.get(1)).put("name", "value");
+                asMap(el.get(2)).put("name", "signature");
+            }
+            done[0] = true;
+        });
+        if (!done[0]) System.err.println("[patch] player-info patch missed the ADD_PLAYER profile");
+    }
+
+    /** Fallback custom payload: an id and the remainder of the packet as data. */
+    static void patchDiscardedPayload(Map<String, Object> tree) {
+        Map<String, Object> group = tree.get("fields") instanceof List<?> l && l.size() == 1 ? asMap(l.getFirst()) : null;
+        if (group != null && group.get("fields") instanceof List<?> gl && gl.size() == 2
+                && "Identifier".equals(asMap(gl.get(0)).get("wire"))) {
+            asMap(gl.get(0)).put("name", "id");
+            asMap(gl.get(1)).put("name", "data");
+            asMap(gl.get(1)).put("note", "the rest of the packet");
+            // the group carried the packet's sole field name by first-fit — flatten it
+            tree.put("fields", gl);
+            return;
+        }
+        System.err.println("[patch] discarded-payload patch missed");
+    }
+
+    /** set_objective's unexplored number-format dispatch: key ids and payload. */
+    static void patchNumberFormat(Map<String, Object> tree) {
+        boolean[] done = {false};
+        forEachNode(tree, n -> {
+            if (!"group".equals(n.get("kind")) || !"Dispatch".equals(n.get("context"))
+                    || !(n.get("fields") instanceof List<?> l) || l.size() != 2) {
+                return;
+            }
+            Map<String, Object> key = asMap(l.get(0));
+            Map<String, Object> value = asMap(l.get(1));
+            if (key == null || !"VarInt".equals(key.get("wire")) || value == null) return;
+            key.put("name", "format");
+            key.put("note", "number format type: 0 = blank, 1 = styled, 2 = fixed");
+            value.put("note", "styled: a style compound; fixed: a text component; blank: nothing follows");
+            done[0] = true;
+        });
+        if (!done[0]) System.err.println("[patch] number-format patch missed");
+    }
+
+    /** Names the packet's single boolean-packed byte and documents its bits. */
+    static void patchFlagByte(Map<String, Object> tree, String note) {
+        int[] seen = {0};
+        forEachNode(tree, n -> {
+            if ("value".equals(n.get("kind"))
+                    && ("Byte".equals(n.get("wire")) || "Unsigned Byte".equals(n.get("wire")))
+                    && n.get("x") == null) {
+                if (seen[0]++ == 0) {
+                    n.putIfAbsent("name", "flags");
+                    n.put("note", note);
+                }
+            }
+        });
+        if (seen[0] != 1) {
+            System.err.println("[patch] flag-byte patch expected 1 byte, saw " + seen[0]);
+        }
+    }
+
+    /** damage_event: the two optional-entity-id reads and the optional source position. */
+    @SuppressWarnings("unchecked")
+    static void patchDamageEvent(Map<String, Object> tree) {
+        if (!(tree.get("fields") instanceof List<?> l)) return;
+        List<Object> fields = (List<Object>) l;
+        int groupAt = -1;
+        for (int i = 0; i < fields.size(); i++) {
+            Map<String, Object> node = asMap(fields.get(i));
+            if (node != null && "group".equals(node.get("kind"))
+                    && "ClientboundDamageEventPacket.readOptionalEntityId".equals(node.get("context"))
+                    && node.get("fields") instanceof List<?> gl && gl.size() == 2) {
+                String[] names = {"sourceCauseId", "sourceDirectId"};
+                for (int j = 0; j < 2; j++) {
+                    Map<String, Object> child = asMap(gl.get(j));
+                    child.put("name", names[j]);
+                    child.put("java", "int");
+                    child.put("note", "0 = absent, otherwise entity id + 1");
+                }
+                groupAt = i;
+                break;
+            }
+        }
+        boolean position = false;
+        for (Object f : fields) {
+            Map<String, Object> node = asMap(f);
+            if (node != null && "optional".equals(node.get("kind")) && node.get("name") == null) {
+                node.put("name", "sourcePosition");
+                node.put("java", "Vec3");
+                position = true;
+            }
+        }
+        if (groupAt >= 0) {
+            // the "sourcePosition"-named wrapper group was a first-fit guess — inline its reads
+            List<Object> children = (List<Object>) asMap(fields.get(groupAt)).get("fields");
+            fields.remove(groupAt);
+            fields.addAll(groupAt, children);
+        }
+        if (groupAt < 0 || !position) {
+            System.err.println("[patch] damage-event patch incomplete (group=" + (groupAt >= 0) + ", position=" + position + ")");
+        }
+    }
+
+    /** custom_query: the payload's identifier read into a local. */
+    static void patchCustomQuery(Map<String, Object> tree) {
+        boolean[] done = {false};
+        forEachNode(tree, n -> {
+            if ("value".equals(n.get("kind")) && "Identifier".equals(n.get("wire")) && n.get("name") == null) {
+                n.put("name", "identifier");
+                done[0] = true;
+            }
+        });
+        if (!done[0]) System.err.println("[patch] custom-query patch missed the identifier");
+    }
+
+    /** DisplayInfo.fromNetwork: flag int gating a background identifier, then x and y floats on one line. */
+    @SuppressWarnings("unchecked")
+    static void patchDisplayInfo(Map<String, Object> tree) {
+        List<Map<String, Object>> groups = new ArrayList<>();
+        forEachNode(tree, n -> {
+            if ("group".equals(n.get("kind")) && "DisplayInfo.fromNetwork".equals(n.get("context"))) groups.add(n);
+        });
+        boolean flagsDone = false, xyDone = false;
+        for (Map<String, Object> group : groups) {
+            if (!(group.get("fields") instanceof List<?> l)) continue;
+            List<Object> fields = (List<Object>) l;
+            for (int i = 0; i < fields.size(); i++) {
+                Map<String, Object> node = asMap(fields.get(i));
+                if (node == null || !"value".equals(node.get("kind"))) continue;
+                if (!flagsDone && "Int".equals(node.get("wire")) && node.get("name") == null) {
+                    node.put("name", "flags");
+                    node.put("java", "int");
+                    node.put("note", "bit 1: a background follows, bit 2: show toast, bit 4: hidden");
+                    Map<String, Object> background = new LinkedHashMap<>();
+                    background.put("kind", "value");
+                    background.put("wire", "Identifier");
+                    background.put("name", "background");
+                    background.put("note", "only present when bit 1 of flags is set");
+                    fields.add(++i, background);
+                    flagsDone = true;
+                } else if (!xyDone && "Float".equals(node.get("wire")) && Integer.valueOf(2).equals(node.get("x"))) {
+                    node.remove("x");
+                    node.put("name", "x");
+                    Map<String, Object> y = new LinkedHashMap<>(node);
+                    y.put("name", "y");
+                    fields.add(i + 1, y);
+                    xyDone = true;
+                }
+            }
+        }
+        if (!flagsDone || !xyDone) {
+            System.err.println("[patch] MISSED DisplayInfo patch (flags=" + flagsDone + ", xy=" + xyDone + ")");
+        }
+    }
+
+    /** Boolean-packed bytes read into several fields (boss_event's darkenScreen/playMusic/createWorldFog). */
+    static void patchFlagBytes(Map<String, Object> tree, int expected, String note) {
+        int[] patched = {0};
+        forEachNode(tree, n -> {
+            if ("value".equals(n.get("kind")) && "Unsigned Byte".equals(n.get("wire"))
+                    && n.get("name") == null && n.get("x") == null) {
+                n.put("name", "flags");
+                n.put("note", note);
+                patched[0]++;
+            }
+        });
+        if (patched[0] != expected) {
+            System.err.println("[patch] flag-byte patch expected " + expected + " nodes, patched " + patched[0]);
+        }
+    }
+
+    /** set_structure_block: two byte-triple vectors and a trailing packed flags byte. */
+    @SuppressWarnings("unchecked")
+    static void patchStructureBlock(Map<String, Object> tree) {
+        if (!(tree.get("fields") instanceof List<?> l)) return;
+        int vecs = 0;
+        boolean flags = false;
+        for (Object f : (List<Object>) l) {
+            Map<String, Object> node = asMap(f);
+            if (node == null || !"value".equals(node.get("kind")) || !"Byte".equals(node.get("wire"))
+                    || node.get("name") != null) {
+                continue;
+            }
+            if (Integer.valueOf(3).equals(node.get("x"))) {
+                node.put("name", vecs == 0 ? "offset" : "size");
+                node.put("java", vecs == 0 ? "BlockPos" : "Vec3i");
+                node.put("note", vecs == 0 ? "x, y, z as one byte each, clamped to -48..48"
+                        : "x, y, z as one byte each, clamped to 0..48");
+                vecs++;
+            } else if (node.get("x") == null) {
+                node.put("name", "flags");
+                node.put("note", "bit 1: ignore entities, bit 2: show air, bit 4: show bounding box, bit 8: strict");
+                flags = true;
+            }
+        }
+        if (vecs != 2 || !flags) {
+            System.err.println("[patch] structure-block patch incomplete (vecs=" + vecs + ", flags=" + flags + ")");
+        }
+    }
+
+    /** Depth-first visit of every node map in a tree, including variant bodies. */
+    @SuppressWarnings("unchecked")
+    static void forEachNode(Map<String, Object> node, java.util.function.Consumer<Map<String, Object>> visitor) {
+        visitor.accept(node);
+        for (String key : new String[]{"inner", "elem", "key", "value", "left", "right", "direct", "body"}) {
+            if (node.get(key) instanceof Map<?, ?> m) forEachNode((Map<String, Object>) m, visitor);
+        }
+        if (node.get("fields") instanceof List<?> l) {
+            for (Object child : l) {
+                if (child instanceof Map<?, ?> m) forEachNode((Map<String, Object>) m, visitor);
+            }
+        }
+        if (node.get("variants") instanceof List<?> l) {
+            for (Object v : l) {
+                if (v instanceof Map<?, ?> m) forEachNode((Map<String, Object>) m, visitor);
+            }
+        }
     }
 
     /* ── string-marker name recovery ────────────────────── */
@@ -1299,7 +1725,35 @@ public class DecodeTracer {
             }
             units.add(current);
         }
+        mergeSplitByteArrays(units);
         return units;
+    }
+
+    /**
+     * A VarInt immediately followed by a raw-bytes read from the same method is a
+     * length-prefixed byte array split across two statements (readVarInt size + readBytes,
+     * e.g. the chunk buffer) — the same wire shape readByteArray labels in one call.
+     */
+    static void mergeSplitByteArrays(List<Unit> units) {
+        for (int i = 0; i + 1 < units.size(); i++) {
+            Unit a = units.get(i), b = units.get(i + 1);
+            if (!a.wire.equals("VarInt") || !(b.wire.equals("Bytes") || b.wire.equals("Raw Bytes"))) continue;
+            if (!sameCallSite(a.path, b.path)) continue;
+            Unit merged = new Unit(a.path, a.invocationKey + "+bytes", "Byte Array", a.bytes + b.bytes);
+            units.set(i, merged);
+            units.remove(i + 1);
+        }
+    }
+
+    /** Same frame chain (class+method), with only the innermost line allowed to differ. */
+    static boolean sameCallSite(List<Frame> a, List<Frame> b) {
+        if (a.size() != b.size() || a.isEmpty()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            Frame fa = a.get(i), fb = b.get(i);
+            if (!fa.className().equals(fb.className()) || !fa.methodName().equals(fb.methodName())) return false;
+            if (i < a.size() - 1 && fa.line() != fb.line()) return false;
+        }
+        return true;
     }
 
     static Map<String, Object> treeFromUnits(List<Unit> units, Class<?> rootClass) {
@@ -1324,9 +1778,12 @@ public class DecodeTracer {
                 group.put("kind", "group");
                 group.put("context", groupLabel(f));
                 // constructors AND static readers (Advancement.read, DisplayInfo.fromNetwork)
-                // produce instances of their own class — usable for field naming
+                // produce instances of their own class — usable for field naming. Lambdas do
+                // not: a collection-element lambda's reads have nothing to do with the fields
+                // of the class that happens to declare it (login's levels elements).
                 if (!f.className().contains(".codec.") && !f.simpleClassName().startsWith("FriendlyByteBuf")
-                        && !f.simpleClassName().startsWith("RegistryFriendlyByteBuf")) {
+                        && !f.simpleClassName().startsWith("RegistryFriendlyByteBuf")
+                        && !f.methodName().startsWith("lambda")) {
                     group.put("_cls", f.className());
                 }
                 List<Object> children = new ArrayList<>();
@@ -1441,6 +1898,12 @@ public class DecodeTracer {
                 dropLeading(fields, "VarInt");
                 return replaced(node, "prefixed", "inner", wrap(fields));
             }
+            case "Either" -> {
+                // the fabricated Boolean always took one branch; the other stays unseen
+                node.putIfAbsent("note",
+                        "the Boolean picks one of two encodings; only the branch the tracer took is shown");
+                return node;
+            }
             default -> {
                 // a hand-written codec that opens with an element count (ByteBufCodecs.readCount)
                 // is a collection: the reads after the count are one element
@@ -1505,7 +1968,10 @@ public class DecodeTracer {
     static final Map<String, String> TRACE_REF_OWNERS = Map.of(
             "net.minecraft.world.item.ItemStack", "ItemStack (optional)",
             "net.minecraft.world.item.ItemStackTemplate", "ItemStackTemplate",
-            "net.minecraft.core.component.DataComponentPatch", "DataComponentPatch");
+            "net.minecraft.core.component.DataComponentPatch", "DataComponentPatch",
+            // LpVec3.read takes a zero-vector early exit on the fabricated buffer, so tracing
+            // sees a lone byte — collapse to the hand-modeled type instead
+            "net.minecraft.network.LpVec3", "Vec3 (lp)");
 
     static String outerClassName(String className) {
         int inner = className.indexOf('$');
@@ -1719,6 +2185,8 @@ public class DecodeTracer {
         for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
             if (ctor.getParameterCount() != children.size()) continue;
             java.lang.reflect.Parameter[] params = ctor.getParameters();
+            // conversion constructors (BlockPos(Vec3i)) name a value after its own supertype
+            if (params.length == 1 && params[0].getType().isAssignableFrom(cls)) continue;
             boolean ok = true;
             for (int i = 0; i < params.length; i++) {
                 String wire = childWire(children.get(i));
@@ -1904,6 +2372,11 @@ public class DecodeTracer {
     static boolean affinityOk(String wire, Class<?> type) {
         // an EnumSet field is always a single fixed bitset on the wire
         if (java.util.EnumSet.class.isAssignableFrom(type)) return wire.equals("EnumSet");
+        // collections on the wire are lists/maps — a scalar read never fills them
+        if (java.util.Collection.class.isAssignableFrom(type) || java.util.Map.class.isAssignableFrom(type)) {
+            return wire.equals("List") || wire.equals("Map") || wire.equals("VarInt List")
+                    || wire.isEmpty() || wire.startsWith("ref:");
+        }
         String simple = type.getSimpleName();
         if (wire.startsWith("ref:")) {
             // a type reference may only name a field of that type (or a super-interface)
@@ -1926,6 +2399,9 @@ public class DecodeTracer {
             case "NBT" -> simple.equals("Tag") || simple.equals("CompoundTag") || simple.equals("Component");
             case "BitSet", "BitSet (fixed)" -> simple.equals("BitSet");
             case "EnumSet" -> simple.equals("EnumSet");
+            // collection-typed fields were already accepted above; arrays are the only other fit
+            case "List", "VarInt List" -> type.isArray();
+            case "Map" -> false;
             default -> true;
         };
     }
@@ -1944,9 +2420,12 @@ public class DecodeTracer {
                 nameChildren((List<Object>) nested, f.getType());
             }
             // a collection field's declared element type names the element's structure;
-            // groups become list nodes only later, so stash the class for the post pass
+            // groups become list nodes only later, so stash the class for the post pass.
+            // Only for groups: post-simplification namings (variant bodies) have no
+            // consumer, and naming finished elements by first-fit fabricates names.
             Class<?> elemClass = genericArg(f);
-            if (elemClass != null && java.util.Collection.class.isAssignableFrom(f.getType())) {
+            if (elemClass != null && java.util.Collection.class.isAssignableFrom(f.getType())
+                    && "group".equals(child.get("kind"))) {
                 child.put("_elemCls", elemClass.getName());
             }
         }
@@ -2011,6 +2490,11 @@ public class DecodeTracer {
     static String childWire(Object child) {
         Map<String, Object> node = (Map<String, Object>) child;
         if ("ref".equals(node.get("kind")) && node.get("ref") instanceof String ref) return "ref:" + ref;
+        String kind = (String) node.get("kind");
+        Object context = node.get("context");
+        // collections keep a marker wire so affinity can route them to collection-typed fields
+        if ("list".equals(kind) || ("group".equals(kind) && "List".equals(context))) return "List";
+        if ("map".equals(kind) || ("group".equals(kind) && "Map".equals(context))) return "Map";
         Object wire = node.get("wire");
         // a codec-wrapper group with a single read is inlined to its child later — match like
         // that child. Container groups (List, Optional, ...) keep their own identity: their

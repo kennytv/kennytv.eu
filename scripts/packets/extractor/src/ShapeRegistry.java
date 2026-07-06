@@ -34,6 +34,7 @@ public class ShapeRegistry {
         register("ofMember", StreamCodec.ofMember((v, b) -> {}, b -> new Object()));
         register("map", dummy.map(x -> x, x -> x));
         register("mapStream", dummy.mapStream(b -> b));
+        register("recursive", StreamCodec.recursive(c -> dummy));
         register("dispatch", dummy.dispatch(x -> x, k -> dummy));
         register("optional", ByteBufCodecs.optional(ByteBufCodecs.BOOL));
         register("collection", ByteBufCodecs.collection(ArrayList::new, ByteBufCodecs.BOOL));

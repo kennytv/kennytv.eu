@@ -113,6 +113,11 @@ public class CodecWalker {
                     case "mapStream" -> {
                         return walk(get(fields, "this$0", codec), expected, walking, depth + 1, false);
                     }
+                    case "recursive" -> {
+                        // self-references resolve through the walking map to a type ref
+                        Object inner = ((java.util.function.Supplier<?>) get(fields, "inner", codec)).get();
+                        return walk(inner, expected, walking, depth + 1, false);
+                    }
                     case "dispatch" -> {
                         return walkDispatch(codec, fields, walking, depth);
                     }
@@ -256,6 +261,8 @@ public class CodecWalker {
         }
 
         String[] names = componentNames(produced, subCodecs.size());
+        // duplicated names come from a mismatched constructor — junk, better unnamed
+        if (names != null && new HashSet<>(List.of(names)).size() != names.length) names = null;
         Class<?>[] javaTypes = componentTypes(produced, subCodecs.size());
 
         List<Object> fieldNodes = new ArrayList<>();
@@ -441,24 +448,40 @@ public class CodecWalker {
         // Probe a few ids to find out what this maps to.
         List<String> values = new ArrayList<>();
         Class<?> valueClass = null;
+        boolean exhausted = false;
         Set<Object> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
         for (int i = 0; i < 512; i++) {
             DecodeTracer.TraceOutcome outcome = DecodeTracer.runScripted((StreamCodec<?, ?>) codec, i);
-            if (!outcome.ok() || outcome.result() == null) break;
+            if (!outcome.ok() || outcome.result() == null) {
+                exhausted = true;
+                break;
+            }
             Object v = outcome.result();
-            if (!seen.add(v)) break;
+            if (!seen.add(v)) {
+                exhausted = true;
+                break;
+            }
             if (valueClass == null) valueClass = v.getClass();
             values.add(keyLabel(v));
+        }
+        String java = null;
+        if (valueClass != null) {
+            Class<?> display = valueClass.isEnum() || valueClass.getSuperclass() == null ? valueClass : valueClass;
+            if (valueClass.isAnonymousClass() && valueClass.getSuperclass().isEnum()) display = valueClass.getSuperclass();
+            java = display.getSimpleName();
         }
         if (values.isEmpty()) {
             return node("value", "wire", "VarInt", "note", "id-mapped");
         }
-        Map<String, Object> n = node("enum", "wire", "VarInt");
-        if (valueClass != null) {
-            Class<?> display = valueClass.isEnum() || valueClass.getSuperclass() == null ? valueClass : valueClass;
-            if (valueClass.isAnonymousClass() && valueClass.getSuperclass().isEnum()) display = valueClass.getSuperclass();
-            n.put("java", display.getSimpleName());
+        // still finding new values at the probe cap: an unbounded id space (block states),
+        // not an enumeration worth listing
+        if (!exhausted) {
+            Map<String, Object> n = node("value", "wire", "VarInt", "note", "id into a table too large to list");
+            if (java != null) n.put("java", java);
+            return n;
         }
+        Map<String, Object> n = node("enum", "wire", "VarInt");
+        if (java != null) n.put("java", java);
         n.put("values", values);
         return n;
     }
@@ -481,8 +504,25 @@ public class CodecWalker {
             case "ClientboundSetEquipmentPacket.STREAM_CODEC" -> setEquipmentNode(walking, depth);
             case "ClientboundSectionBlocksUpdatePacket.STREAM_CODEC" -> sectionBlocksUpdateNode();
             case "Vec3.LP_STREAM_CODEC" -> lpVec3Node();
+            case "MapItemSavedData.MapPatch.STREAM_CODEC" -> mapPatchNode();
             default -> null;
         };
+    }
+
+    /** MapPatch: an optional whose presence flag doubles as the patch width — tracing sees only the 0 byte. */
+    static Map<String, Object> mapPatchNode() {
+        Map<String, Object> n = node("container", "java", "MapPatch",
+                "note", "a rectangular update to the map's color data");
+        List<Object> fields = new ArrayList<>();
+        fields.add(node("value", "wire", "Unsigned Byte", "name", "width",
+                "note", "0 = no patch, nothing follows"));
+        fields.add(node("value", "wire", "Unsigned Byte", "name", "height"));
+        fields.add(node("value", "wire", "Unsigned Byte", "name", "startX"));
+        fields.add(node("value", "wire", "Unsigned Byte", "name", "startY"));
+        fields.add(node("value", "wire", "Byte Array", "name", "mapColors", "java", "byte[]",
+                "note", "width * height entries, row by row"));
+        n.put("fields", fields);
+        return n;
     }
 
     /** LpVec3: bit-packed quantized vector — tracing shows the reads but not the packing. */
@@ -625,6 +665,7 @@ public class CodecWalker {
         return switch (name) {
             case "ItemStack (optional)" -> ensureType(name, () -> itemStackNode(false, new IdentityHashMap<>(), 0));
             case "DataComponentPatch" -> ensureType(name, () -> dataComponentPatchNode(false, new IdentityHashMap<>(), 0));
+            case "Vec3 (lp)" -> ensureType(name, CodecWalker::lpVec3Node);
             default -> {
                 Object codec = PacketExtractor.CODEC_BY_LABEL.get(name + ".STREAM_CODEC");
                 if (codec != null) {
@@ -685,6 +726,7 @@ public class CodecWalker {
             DecodeTracer.applyStringNames(tree, outcome);
         }
         DecodeTracer.dedupeInnerNames(tree);
+        DecodeTracer.applyHandPatches(tree, produced);
 
         // collapse single-leaf traces to plain values, keeping the field's name and java type
         Object fieldList = tree.get("fields");
