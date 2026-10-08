@@ -65,6 +65,9 @@ def main():
         # Insert in sorted position
         inserted = False
         for i, existing in enumerate(versions):
+            # Ignore non-release entries (e.g. April Fools snapshots) when finding the position
+            if not all(x.isdigit() for x in existing.split('.')):
+                continue
             if version_compare(version, existing) < 0:
                 versions.insert(i, version)
                 inserted = True
