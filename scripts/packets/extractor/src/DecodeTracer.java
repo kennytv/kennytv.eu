@@ -1534,8 +1534,14 @@ public class DecodeTracer {
      */
     static void applyHandPatches(Map<String, Object> tree, Class<?> produced) {
         if (produced == null) return;
+        // older versions read DisplayInfo inline (Advancement's display group)
+        forEachNode(tree, n -> {
+            if ("group".equals(n.get("kind")) && String.valueOf(n.get("context")).startsWith("DisplayInfo")) patchDisplayInfo(n);
+        });
         switch (PacketExtractor.nestedName(produced)) {
-            case "DisplayInfo" -> patchDisplayInfo(tree);
+            case "DisplayInfo" -> {
+                if (!patchDisplayInfo(tree)) System.err.println("[patch] MISSED DisplayInfo flags");
+            }
             case "ClientboundBossEventPacket" -> patchFlagBytes(tree, 2,
                     "0x01: darken screen, 0x02: play boss music, 0x04: create world fog");
             case "ServerboundSetStructureBlockPacket" -> patchStructureBlock(tree);
@@ -1553,6 +1559,10 @@ public class DecodeTracer {
             case "DiscardedPayload" -> patchDiscardedPayload(tree);
             case "ClientboundMoveEntityPacket.Pos", "ClientboundMoveEntityPacket.PosRot" -> patchMoveEntity(tree);
             case "ServerboundCustomQueryAnswerPacket" -> patchCustomQueryAnswer(tree);
+            case "ClientboundCommandsPacket" -> patchCommands(tree);
+            case "ClientboundUpdateMobEffectPacket" ->
+                    patchFlagByte(tree, "0x01: ambient, 0x02: visible, 0x04: show icon, 0x08: blend");
+            case "ClientboundSoundPacket" -> patchFixedPoint(tree, "Int", 3, "block coordinate × 8 (fixed point)");
             default -> { }
         }
     }
@@ -1604,6 +1614,25 @@ public class DecodeTracer {
                 Map.of("key", "0 (linear)", "body", new LinkedHashMap<>(Map.of("kind", "container", "java", "Linear", "fields", triple))),
                 Map.of("key", "1 or more (stepped)", "body", new LinkedHashMap<>(Map.of("kind", "container", "java", "Stepped", "fields", List.of(step))))));
         fields.set(deltaAt, dispatch);
+    }
+
+    /**
+     * Pre-26.3 commands: entries are read by a static method and the constructor validates
+     * child indices, so only a zero-entry trace succeeds — the element is the hand model.
+     */
+    static void patchCommands(Map<String, Object> tree) {
+        boolean[] done = {false};
+        forEachNode(tree, n -> {
+            if ("list".equals(n.get("kind")) && "entries".equals(n.get("name")) && asMap(n.get("elem")) != null
+                    && "value".equals(asMap(n.get("elem")).get("kind"))) {
+                Map<String, Object> ref = new LinkedHashMap<>();
+                ref.put("kind", "ref");
+                ref.put("ref", CodecWalker.ensureTraceType("ClientboundCommandsPacket (entry)"));
+                n.put("elem", ref);
+                done[0] = true;
+            }
+        });
+        if (!done[0]) System.err.println("[patch] commands patch missed the entries list");
     }
 
     /**
@@ -1670,6 +1699,19 @@ public class DecodeTracer {
         System.err.println("[patch] discarded-payload patch missed");
     }
 
+    /** Fixed-point coordinates: the first {@code count} root reads of a wire type, scaled ints. */
+    @SuppressWarnings("unchecked")
+    static void patchFixedPoint(Map<String, Object> tree, String wire, int count, String note) {
+        int seen = 0;
+        for (Object f : (List<Object>) tree.get("fields")) {
+            Map<String, Object> node = asMap(f);
+            if (node == null || !wire.equals(node.get("wire")) || seen >= count) continue;
+            node.put("note", note);
+            seen++;
+        }
+        if (seen != count) System.err.println("[patch] fixed-point patch expected " + count + " " + wire + ", saw " + seen);
+    }
+
     /** Names the packet's single boolean-packed byte and documents its bits. */
     static void patchFlagByte(Map<String, Object> tree, String note) {
         int[] seen = {0};
@@ -1734,7 +1776,7 @@ public class DecodeTracer {
 
     /** DisplayInfo.fromNetwork: a flag int packing three booleans, the first gating a background identifier. */
     @SuppressWarnings("unchecked")
-    static void patchDisplayInfo(Map<String, Object> tree) {
+    static boolean patchDisplayInfo(Map<String, Object> tree) {
         List<Object> fields = (List<Object>) tree.get("fields");
         for (int i = 0; i < fields.size(); i++) {
             Map<String, Object> node = asMap(fields.get(i));
@@ -1748,9 +1790,9 @@ public class DecodeTracer {
             background.put("name", "background");
             background.put("note", "only present when flags & 0x01");
             fields.add(i + 1, background);
-            return;
+            return true;
         }
-        System.err.println("[patch] MISSED DisplayInfo flags");
+        return false;
     }
 
     /** Boolean-packed bytes read into several fields (boss_event's darkenScreen/playMusic/createWorldFog). */
@@ -1954,7 +1996,9 @@ public class DecodeTracer {
             "readMap", "Map",
             "readOptional", "Optional",
             "readNullable", "Optional", // same wire concept: Boolean presence flag + value
-            "readEither", "Either");
+            "readEither", "Either",
+            // composite helper (pre-26.3 use_item_on): its reads are the structure
+            "readBlockHitResult", "BlockHitResult");
 
     /** Known wire-helper frames: (class-suffix match, method prefix) -> label. Order matters: innermost wins. */
     static String helperLabel(Frame f) {
@@ -2171,8 +2215,9 @@ public class DecodeTracer {
             // reference to their hand-modeled shared type.
             String refType = null;
             for (int i = 0; i < path.size(); i++) {
-                refType = TRACE_REF_OWNERS.getOrDefault(path.get(i).className(),
-                        TRACE_REF_OWNERS.get(outerClassName(path.get(i).className())));
+                refType = TRACE_REF_METHODS.getOrDefault(path.get(i).className() + "#" + path.get(i).methodName(),
+                        TRACE_REF_OWNERS.getOrDefault(path.get(i).className(),
+                                TRACE_REF_OWNERS.get(outerClassName(path.get(i).className()))));
                 if (refType != null) {
                     path = path.subList(0, i);
                     wire = "ref:" + refType;
@@ -2263,7 +2308,8 @@ public class DecodeTracer {
             // find common prefix depth with open groups
             int common = 0;
             while (common < stack.size() && common < u.path.size()
-                    && stack.get(common).frameKey.equals(levelKey(u.path, common))) {
+                    && stack.get(common).frameKey.equals(levelKey(u.path, common))
+                    && !reinvoked(stack.get(common), u, common)) {
                 common++;
             }
             while (stack.size() > common) stack.removeLast();
@@ -2284,7 +2330,9 @@ public class DecodeTracer {
                 List<Object> children = new ArrayList<>();
                 group.put("fields", children);
                 currentChildren(stack, rootChildren).add(group);
-                stack.add(new GroupLevel(levelKey(u.path, stack.size()), children));
+                int level = stack.size();
+                stack.add(new GroupLevel(levelKey(u.path, level), children,
+                        u.path.size() == level + 1 ? f.line() : -1, u.wire));
             }
             Map<String, Object> leaf = new LinkedHashMap<>();
             if (u.wire.startsWith("codec:")) {
@@ -2296,6 +2344,7 @@ public class DecodeTracer {
             } else {
                 leaf.put("kind", "value");
                 leaf.put("wire", u.wire);
+                if (u.wire.equals("BitSet (fixed)")) leaf.put("note", u.bytes + " bytes");
                 if (u.countRead) leaf.put("_count", true);
                 // several same-line reads of a fixed-size primitive merge into one unit; surface the count
                 int prim = primitiveSize(u.wire);
@@ -2481,6 +2530,10 @@ public class DecodeTracer {
             // Packed.read directly rather than through the codec)
             "net.minecraft.network.chat.MessageSignature$Packed", "MessageSignature.Packed");
 
+    /** Reader methods whose reads collapse into hand-modeled types (pre-codec versions). */
+    static final Map<String, String> TRACE_REF_METHODS = Map.of(
+            "net.minecraft.network.protocol.game.ClientboundCommandsPacket#readNode", "ClientboundCommandsPacket (entry)");
+
     static String outerClassName(String className) {
         int inner = className.indexOf('$');
         return inner >= 0 ? className.substring(0, inner) : className;
@@ -2531,7 +2584,26 @@ public class DecodeTracer {
         }
     }
 
-    record GroupLevel(String frameKey, List<Object> children) {}
+    /** An open group while assembling; {@code headLine} is where its container read its count/flag. */
+    record GroupLevel(String frameKey, List<Object> children, int headLine, String headWire) {}
+
+    /**
+     * A container helper called again from the same call site — several readList calls in one
+     * multi-line constructor call share their caller's line — shows by its head read (count,
+     * presence flag) recurring: that starts a new group instead of extending the old one.
+     */
+    static boolean reinvoked(GroupLevel level, Unit u, int depth) {
+        // head plus at least one read after it: readNullable reads flag and value on one line
+        if (level.headLine() < 0 || level.children().size() < 2 || u.path.size() != depth + 1) return false;
+        Frame f = u.path.get(depth);
+        return f.line() == level.headLine() && u.wire.equals(level.headWire()) && isContainerFrame(f);
+    }
+
+    static boolean isContainerFrame(Frame f) {
+        if (isBufFrame(f)) return COLLECTION_HELPERS.containsKey(f.methodName());
+        String kind = ShapeRegistry.kindOfClassName(f.className());
+        return kind != null && java.util.Set.of("mapCodec", "collection", "optional", "either", "lengthPrefixed").contains(kind);
+    }
 
     /** A semantic read unit: one helper invocation (possibly several primitive reads). */
     static class Unit {

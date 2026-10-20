@@ -202,6 +202,99 @@ public class PerturbNaming {
 
     record Branch(List<DecodeTracer.Unit> baseMiddle, List<DecodeTracer.Unit> replayMiddle) {}
 
+    /**
+     * Hand-written loops ({@code new Node[input.readVarInt()]} then a for loop): a VarInt whose
+     * replays with 0 and 2 drop resp. duplicate the reads after it is a count. The siblings
+     * made of those reads become the element of a list.
+     */
+    @SuppressWarnings("unchecked")
+    static void applyLoopCounts(Map<String, Object> tree) {
+        List<List<Object>> fieldLists = new ArrayList<>();
+        DecodeTracer.forEachNode(tree, n -> {
+            if (n.get("fields") instanceof List<?> l) fieldLists.add((List<Object>) l);
+        });
+        for (List<Object> fields : fieldLists) {
+            for (int i = 0; i < fields.size() - 1; i++) {
+                Map<String, Object> count = DecodeTracer.asMap(fields.get(i));
+                if (count == null || !"value".equals(count.get("kind")) || !"VarInt".equals(count.get("wire"))) continue;
+                Source src = SOURCES.get(count);
+                if (src == null || !src.outcome().ok() || src.outcome().events().get(src.event()).value() != 1) continue;
+                int[] range = loopRange(src);
+                if (range == null) continue;
+                // siblings whose reads all fall inside one iteration form the element
+                int end = i + 1;
+                while (end < fields.size() && within(DecodeTracer.asMap(fields.get(end)), src.outcome(), range)) end++;
+                if (end == i + 1) continue;
+                List<Object> element = new ArrayList<>(fields.subList(i + 1, end));
+                Map<String, Object> list = new java.util.LinkedHashMap<>();
+                list.put("kind", "list");
+                list.put("elem", DecodeTracer.wrap(element));
+                for (int k = end - 1; k > i; k--) fields.remove(k);
+                fields.set(i, list);
+            }
+        }
+        // a reader method holding nothing but the loop (Path.readNodeArray) is that list
+        DecodeTracer.forEachNode(tree, n -> {
+            if ("group".equals(n.get("kind")) && n.get("fields") instanceof List<?> l && l.size() == 1
+                    && DecodeTracer.asMap(l.getFirst()) != null && "list".equals(DecodeTracer.asMap(l.getFirst()).get("kind"))) {
+                Map<String, Object> list = DecodeTracer.asMap(l.getFirst());
+                Object name = n.get("name"), java = n.get("java");
+                n.clear();
+                n.putAll(list);
+                if (name != null) n.put("name", name);
+                if (java != null) n.put("java", java);
+            }
+        });
+    }
+
+    /** Event-index range [from, to) of one loop iteration after the count, or null if it is no count. */
+    static int[] loopRange(Source src) {
+        DecodeTracer.TraceOutcome zero = src.outcome().perturbed(src.event(), 0, false);
+        DecodeTracer.TraceOutcome two = src.outcome().perturbed(src.event(), 2, false);
+        if (!zero.ok() || !two.ok()) return null;
+        List<String> base = wires(src.outcome().events()), none = wires(zero.events()), twice = wires(two.events());
+        int per = base.size() - none.size();
+        if (per <= 0 || twice.size() - base.size() != per) return null;
+        // the count's own bytes end where the next read starts
+        int from = src.event() + 1;
+        while (from < src.outcome().events().size() && sameRead(src.outcome().events(), src.event(), from)) from++;
+        int to = from + per;
+        if (to > base.size()) return null;
+        // 2: the iteration's reads occur twice in a row; 0: they are gone
+        List<String> iteration = base.subList(from, to);
+        List<String> expectTwice = new ArrayList<>(base.subList(0, to));
+        expectTwice.addAll(iteration);
+        expectTwice.addAll(base.subList(to, base.size()));
+        List<String> expectNone = new ArrayList<>(base.subList(0, from));
+        expectNone.addAll(base.subList(to, base.size()));
+        return expectTwice.equals(twice) && expectNone.equals(none) ? new int[]{from, to} : null;
+    }
+
+    /** Event signature for loop comparison: op + byte length, aligned with event indices. */
+    static List<String> wires(List<DecodeTracer.Event> events) {
+        List<String> out = new ArrayList<>();
+        for (DecodeTracer.Event ev : events) out.add(ev.op() + ev.byteLength());
+        return out;
+    }
+
+    /** Whether event {@code j} continues the varint read starting at {@code i} (same stack, continuation bytes). */
+    static boolean sameRead(List<DecodeTracer.Event> events, int i, int j) {
+        return events.get(j).context().equals(events.get(i).context()) && (events.get(j - 1).value() & 0x80) != 0;
+    }
+
+    /** Whether all reads of a node's subtree lie inside the event range. */
+    static boolean within(Map<String, Object> node, DecodeTracer.TraceOutcome outcome, int[] range) {
+        if (node == null) return false;
+        boolean[] any = {false}, out = {false};
+        DecodeTracer.forEachNode(node, n -> {
+            Source s = SOURCES.get(n);
+            if (s == null) return;
+            if (s.outcome() != outcome || s.event() < range[0] || s.event() >= range[1]) out[0] = true;
+            any[0] = true;
+        });
+        return any[0] && !out[0];
+    }
+
     /** The reads that differ between the decode and its replay with the Boolean flipped. */
     static Branch flip(Source src) {
         DecodeTracer.TraceOutcome replay = src.outcome().perturbed(src.event(), 0, false);
@@ -391,8 +484,16 @@ public class PerturbNaming {
             firstId.put(label, v);
         }
         if (firstId.size() < 2) return null;
+        // -1 for "none" (GameType.byNullableId)
+        // -1 for "none" (GameType.byNullableId) — only when an out-of-range id does not also
+        // decode to nothing (then -1 is just out of range too)
+        int maxId = java.util.Collections.max(firstId.values());
+        DecodeTracer.TraceOutcome minus = src.outcome().perturbed(src.event(), -1, true);
+        DecodeTracer.TraceOutcome beyond = src.outcome().perturbed(src.event(), maxId + 1, true);
+        boolean noneAtMinusOne = minus.ok() && read(minus.result(), path) == null
+                && !(beyond.ok() && read(beyond.result(), path) == null);
         List<String> out = new ArrayList<>();
-        boolean ordinal = type.isEnum();
+        boolean ordinal = type.isEnum() && !noneAtMinusOne;
         Object[] constants = type.isEnum() ? type.getEnumConstants() : new Object[0];
         int i = 0;
         for (var entry : firstId.entrySet()) {
@@ -402,6 +503,7 @@ public class PerturbNaming {
             i++;
         }
         for (var entry : firstId.entrySet()) out.add(ordinal ? entry.getKey() : entry.getKey() + "=" + entry.getValue());
+        if (noneAtMinusOne) out.addFirst("none=-1");
         return out;
     }
 

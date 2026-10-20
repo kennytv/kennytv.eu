@@ -625,7 +625,9 @@ public class CodecWalker {
         // still finding new values at the probe cap: an unbounded id space (block states),
         // not an enumeration worth listing
         if (!exhausted) {
-            Map<String, Object> n = node("value", "wire", "VarInt", "note", "id into a table too large to list");
+            Map<String, Object> n = node("value", "wire", "VarInt", "note",
+                    valueClass != null && valueClass.getSimpleName().equals("BlockState")
+                            ? "block state id" : "id into a table too large to list");
             if (java != null) n.put("java", java);
             return n;
         }
@@ -644,8 +646,9 @@ public class CodecWalker {
     static Map<String, Object> specialCodec(String label, IdentityHashMap<Object, String> walking, int depth) {
         if (label == null) return null;
         return switch (label) {
-            case "ItemStack.STREAM_CODEC", "ItemStack.OPTIONAL_STREAM_CODEC" -> itemStackNode(false, walking, depth);
-            case "ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC" -> itemStackNode(true, walking, depth);
+            case "ItemStack.STREAM_CODEC" -> itemStackNode(false, false, walking, depth);
+            case "ItemStack.OPTIONAL_STREAM_CODEC" -> itemStackNode(false, true, walking, depth);
+            case "ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC" -> itemStackNode(true, true, walking, depth);
             case "DataComponentPatch.STREAM_CODEC" -> dataComponentPatchNode(false, walking, depth);
             case "DataComponentPatch.DELIMITED_STREAM_CODEC" -> dataComponentPatchNode(true, walking, depth);
             // manual loop packets whose bit-packed/sentinel formats tracing cannot express
@@ -835,7 +838,7 @@ public class CodecWalker {
         }
         entryFields.add(slot);
         entryFields.add(node("ref", "ref", ensureType("ItemStack (optional)",
-                () -> itemStackNode(false, walking, depth + 1)), "name", "item"));
+                () -> itemStackNode(false, true, walking, depth + 1)), "name", "item"));
         entry.put("fields", entryFields);
         fields.add(entry);
         n.put("fields", fields);
@@ -854,10 +857,12 @@ public class CodecWalker {
         return n;
     }
 
-    static Map<String, Object> itemStackNode(boolean delimited, IdentityHashMap<Object, String> walking, int depth) {
+    static Map<String, Object> itemStackNode(boolean delimited, boolean optional, IdentityHashMap<Object, String> walking, int depth) {
         Map<String, Object> n = node("container", "java", "ItemStack");
         List<Object> fields = new ArrayList<>();
-        fields.add(node("value", "wire", "VarInt", "name", "count", "note", "0 or less = empty ItemStack, nothing follows"));
+        fields.add(node("value", "wire", "VarInt", "name", "count", "note", optional
+                ? "0 or less = empty ItemStack, nothing follows"
+                : "must be positive: an empty stack is rejected"));
         fields.add(node("registry", "registry", "minecraft:item", "name", "item"));
         String patchType = delimited ? "DataComponentPatch (delimited)" : "DataComponentPatch";
         fields.add(node("ref", "ref", ensureType(patchType, () -> dataComponentPatchNode(delimited, walking, depth + 1)), "name", "components"));
@@ -919,10 +924,11 @@ public class CodecWalker {
     /** Ensure a type referenced from a trace collapse exists — hand-modeled or walked from its constant. */
     static String ensureTraceType(String name) {
         return switch (name) {
-            case "ItemStack (optional)" -> ensureType(name, () -> itemStackNode(false, new IdentityHashMap<>(), 0));
+            case "ItemStack (optional)" -> ensureType(name, () -> itemStackNode(false, true, new IdentityHashMap<>(), 0));
             case "DataComponentPatch" -> ensureType(name, () -> dataComponentPatchNode(false, new IdentityHashMap<>(), 0));
             case "Vec3 (lp)" -> ensureType(name, CodecWalker::lpVec3Node);
             case "MessageSignature.Packed" -> ensureType(name, CodecWalker::packedSignatureNode);
+            case "ClientboundCommandsPacket (entry)" -> ensureType(name, CodecWalker::commandEntryNode);
             default -> {
                 Object codec = PacketExtractor.CODEC_BY_LABEL.get(name + ".STREAM_CODEC");
                 if (codec != null) {
@@ -1045,7 +1051,8 @@ public class CodecWalker {
     static final Map<String, String> CONSTANT_NOTES = Map.of(
             "ByteBufCodecs.OPTIONAL_VAR_INT", "0 = absent, otherwise value + 1",
             "ByteBufCodecs.ROTATION_BYTE", "angle in 1/256ths of a full turn",
-            "ByteBufCodecs.INSTANT", "milliseconds since the Unix epoch");
+            "ByteBufCodecs.INSTANT", "milliseconds since the Unix epoch",
+            "ByteBufCodecs.OPTIONAL_COMPOUND_TAG", "absent = TAG_End (a single 0 byte), no presence Boolean");
 
     /**
      * A number mapped to a set of enum constants (Relative.SET_STREAM_CODEC): decode each
@@ -1130,11 +1137,21 @@ public class CodecWalker {
         }
 
         Map<String, Object> tree = DecodeTracer.traceTreeWithBranches((StreamCodec<?, ?>) codec, produced, outcome);
+        if (outcome.template().varintValue == 0) {
+            // only zero counts decoded: list/map elements in this trace were never read
+            boolean[] lists = {false};
+            DecodeTracer.forEachNode(tree, n -> lists[0] |= "list".equals(n.get("kind")) || "map".equals(n.get("kind")));
+            if (lists[0]) {
+                System.err.println("[tracer] WARNING " + (produced != null ? produced.getName() : codec.getClass().getName())
+                        + " decodes only with zero counts; list elements are not captured");
+            }
+        }
         if (produced != null) tree.put("java", produced.getSimpleName());
         if (!DecodeTracer.hasEnumBranching(outcome.events())) {
             DecodeTracer.applyStringNames(tree, outcome);
         }
         DecodeTracer.dedupeInnerNames(tree);
+        PerturbNaming.applyLoopCounts(tree);
         PerturbNaming.apply(tree);
         PerturbNaming.applyBooleanBranches(tree);
         DecodeTracer.mergeTracedVariants(tree);
