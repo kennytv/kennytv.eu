@@ -21,6 +21,11 @@ class EntityClass:
     super_class: Optional[str]
     data_fields: List[EntityData]
     file_path: str
+    qualified: str = ''
+    raw_super: Optional[str] = None
+
+
+ENTITY_ROOT = 'net.minecraft.world.entity.Entity'
 
 
 def format_class_name(class_name: str) -> str:
@@ -91,6 +96,7 @@ class MinecraftEntityAnalyzer:
     def __init__(self, source_dir: str):
         self.source_dir = source_dir
         self.entity_classes: Dict[str, EntityClass] = {}
+        self.file_imports: Dict[str, tuple] = {}
 
         # To find fields like: EntityDataAccessor<Boolean> DATA_CUSTOM_NAME_VISIBLE = SynchedEntityData.defineId(Entity.class, EntityDataSerializers.BOOLEAN);
         self.data_pattern = re.compile(
@@ -141,6 +147,9 @@ class MinecraftEntityAnalyzer:
             i += 1
         return None
 
+    package_pattern = re.compile(r'^\s*package\s+([\w.]+)\s*;', re.MULTILINE)
+    import_pattern = re.compile(r'^\s*import\s+([\w.]+)\s*;', re.MULTILINE)
+
     def parse_java_file(self, file_path: str) -> Optional[List[EntityClass]]:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -149,6 +158,12 @@ class MinecraftEntityAnalyzer:
         class_matches = self.class_pattern.findall(content)
         if not class_matches:
             return None
+
+        package_match = self.package_pattern.search(content)
+        package = package_match.group(1) if package_match else ''
+        file_class = os.path.splitext(os.path.basename(file_path))[0]
+        imports = {imp.rsplit('.', 1)[-1]: imp for imp in self.import_pattern.findall(content)}
+        self.file_imports[file_path] = (package, file_class, imports)
 
         # Build a lookup of raw constant name -> default value from all define() calls
         defaults = {}
@@ -206,11 +221,16 @@ class MinecraftEntityAnalyzer:
             if super_class is not None:
                 super_class = format_class_name(super_class)
 
+            # Nested classes are qualified by the file's top-level class (deeper nesting does not occur for entities)
+            simple = match[0]
+            qualified = f'{package}.{simple}' if simple == file_class else f'{package}.{file_class}.{simple}'
             entity_classes.append(EntityClass(
                 name=class_name,
                 super_class=super_class,
                 data_fields=data_fields,
-                file_path=file_path
+                file_path=file_path,
+                qualified=qualified,
+                raw_super=match[1] or None
             ))
 
         # Warn about define() calls that didn't match any field definition
@@ -226,6 +246,13 @@ class MinecraftEntityAnalyzer:
         return entity_classes
 
     def find_entity_files(self):
+        """Parse the whole source tree, then keep exactly the classes descending from Entity.
+
+        A plain simple-name lookup would confuse unrelated classes sharing a name, so
+        superclasses are resolved like javac would: nested class, single-type import, same
+        package.
+        """
+        by_qualified: Dict[str, EntityClass] = {}
         for root, _, files in os.walk(self.source_dir):
             for file in files:
                 if file.endswith('.java'):
@@ -233,7 +260,66 @@ class MinecraftEntityAnalyzer:
                     entity_classes = self.parse_java_file(file_path)
                     if entity_classes:
                         for entity_class in entity_classes:
-                            self.entity_classes[entity_class.name] = entity_class
+                            by_qualified.setdefault(entity_class.qualified, entity_class)
+
+        resolved = {q: self.resolve_super(c, by_qualified) for q, c in by_qualified.items()}
+
+        def is_entity(q: Optional[str]) -> bool:
+            seen = set()
+            while q and q not in seen:
+                if q == ENTITY_ROOT:
+                    return True
+                seen.add(q)
+                q = resolved.get(q)
+            return False
+
+        # Ignore side-specific subclasses (ServerPlayer, LocalPlayer, ClientMannequin)
+        entities = [c for q, c in by_qualified.items()
+                    if is_entity(q) and not q.startswith(('net.minecraft.client.', 'net.minecraft.server.'))]
+        if not any(c.qualified == ENTITY_ROOT for c in entities):
+            print(f'Warning: {ENTITY_ROOT} not found under {self.source_dir}')
+
+        # Display names stay the prettified simple names
+        counts: Dict[str, int] = {}
+        for c in entities:
+            counts[c.name] = counts.get(c.name, 0) + 1
+        display: Dict[str, str] = {}
+        for c in entities:
+            if counts[c.name] > 1:
+                outer, simple = c.qualified.rsplit('.', 2)[-2:]
+                display[c.qualified] = format_class_name(f'{outer}.{simple}')
+                print(f'Warning: entity class name {c.name} is ambiguous, using {display[c.qualified]} for {c.qualified}')
+            else:
+                display[c.qualified] = c.name
+
+        for c in entities:
+            parent = resolved.get(c.qualified)
+            c.name = display[c.qualified]
+            # the root keeps no superclass; every other entity names its resolved parent
+            c.super_class = display.get(parent) if parent else None
+            if c.qualified != ENTITY_ROOT and c.super_class is None:
+                print(f'Warning: could not resolve superclass {c.raw_super} of {c.qualified}')
+            self.entity_classes[c.name] = c
+
+    def resolve_super(self, entity_class: EntityClass, by_qualified: Dict[str, EntityClass]) -> Optional[str]:
+        raw = entity_class.raw_super
+        if not raw:
+            return None
+        package, file_class, imports = self.file_imports[entity_class.file_path]
+        head, _, rest = raw.partition('.')
+        outer = entity_class.qualified[:entity_class.qualified.rfind('.')]
+        bases = [
+            f'{outer}.{head}',                 # sibling nested class
+            f'{package}.{file_class}.{head}',  # nested in the file's top-level class
+            imports.get(head),                 # single-type import
+            f'{package}.{head}',               # same package
+        ]
+        candidates = [raw] if raw.startswith('net.') else []  # fully qualified
+        candidates += [f'{b}.{rest}' if rest else b for b in bases if b]
+        for q in candidates:
+            if q in by_qualified and q != entity_class.qualified:
+                return q
+        return None
 
     def get_inheritance_chain(self, class_name: str) -> List[str]:
         chain = []
@@ -258,8 +344,7 @@ class MinecraftEntityAnalyzer:
     def generate_report(self) -> str:
         # Include all Entity subclasses, even if they have no data
         sorted_classes = sorted(
-            [ec for ec in self.entity_classes.values()
-             if ec.data_fields or 'Entity' in self.get_inheritance_chain(ec.name)],
+            self.entity_classes.values(),
             key=lambda c: (len(self.get_inheritance_chain(c.name)), c.name)
         )
 
@@ -293,8 +378,7 @@ class MinecraftEntityAnalyzer:
     def generate_json(self) -> Dict[str, Any]:
         """Generate a JSON-serializable dict of all entity data."""
         sorted_classes = sorted(
-            [ec for ec in self.entity_classes.values()
-             if ec.data_fields or 'Entity' in self.get_inheritance_chain(ec.name)],
+            self.entity_classes.values(),
             key=lambda c: (len(self.get_inheritance_chain(c.name)), c.name)
         )
 
@@ -328,7 +412,7 @@ def analyze(source_dir: str) -> 'MinecraftEntityAnalyzer':
 
 def main(file_name: str, last_content: str) -> str:
     # source_dir = os.path.join("src", "main", "java", "net", "minecraft", "world", "entity")
-    source_dir = expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft", "world", "entity"))
+    source_dir = expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft"))
 
     analyzer = MinecraftEntityAnalyzer(source_dir)
     analyzer.find_entity_files()

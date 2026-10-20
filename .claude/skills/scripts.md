@@ -8,7 +8,7 @@
 
 ### Entity Data (`scripts/entities/`)
 
-- `entity_data.py` — `MinecraftEntityAnalyzer` class: parses Java source files for `EntityDataAccessor` definitions via regex, calculates field indices through inheritance chains, generates Markdown and JSON output.
+- `entity_data.py` — `MinecraftEntityAnalyzer` class: parses the whole `net/minecraft` source tree, resolves `extends` via nested classes/imports/package (not bare simple names), keeps exactly the classes descending from `world.entity.Entity` except side-specific ones in `client`/`server` packages (they never hold data), parses `EntityDataAccessor` definitions via regex, calculates field indices through inheritance chains, generates Markdown and JSON output. Warns on ambiguous display names and unresolved superclasses.
 - `all_entity_data.py` — Iterates release commits in a Minecraft source repo (skips snapshots), runs the analyzer at each, produces multi-version `entity-data.json` with deduplication.
 - `single_entity_data.py` — Adds/updates a single version in `public/entity-data.json`.
 

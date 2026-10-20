@@ -58,7 +58,7 @@ def main():
             subprocess.run(['git', 'checkout', commit_hash], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             analyzer = entity_data.analyze(
-                os.path.expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft", "world", "entity"))
+                os.path.expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft"))
             )
             version_json = analyzer.generate_json()
 

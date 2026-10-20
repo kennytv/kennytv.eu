@@ -5,7 +5,7 @@ import entity_data
 
 OUTPUT_DIR = os.path.join('public', 'entity-data')
 VERSIONS_PATH = os.path.join(OUTPUT_DIR, 'versions.json')
-SOURCE_DIR = os.path.expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft", "world", "entity"))
+SOURCE_DIR = os.path.expanduser(os.path.join("~", "IdeaProjects", "MCSources", "src", "main", "java", "net", "minecraft"))
 
 
 def load_versions() -> list:
