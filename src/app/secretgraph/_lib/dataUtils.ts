@@ -2,6 +2,19 @@ import type { ServerData, ChartDataPoint } from '@/lib/types';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Before a graph starts, counts below this are noise (misreported versions, test servers on
+ * pre-releases) and don't start it. Once started, every server type is graphed unfiltered:
+ * Spigot is derived as global Bukkit minus Paper, and Paper servers without bStats plugins
+ * are missing from the Bukkit count, so Spigot can legitimately dip low or below zero.
+ */
+const MIN_SERVER_COUNT = 10;
+
+function count(value: number | undefined, filter: boolean): number {
+  if (value === undefined) return 0;
+  return filter && value < MIN_SERVER_COUNT ? 0 : value;
+}
+
 function daysDiff(date1: Date, date2: Date): number {
   return Math.round(Math.abs((date1.getTime() - date2.getTime()) / DAY_MS));
 }
@@ -28,9 +41,10 @@ export function processChartData(
       }
     }
 
-    // Build this day's data point
-    const point = buildDataPoint(date, entry.data, platformIds, selectedVersions, sumMode);
-    if (point === null) {
+    // Until the graph starts, only counts above the noise floor count as data
+    const started = lastDate !== null;
+    const { point, hasData } = buildDataPoint(date, entry.data, platformIds, selectedVersions, sumMode, !started);
+    if (!hasData && !started) {
       continue;
     }
 
@@ -54,7 +68,8 @@ function buildDataPoint(
   platformIds: string[],
   selectedVersions: string[],
   sumMode: boolean,
-): ChartDataPoint | null {
+  filter: boolean,
+): { point: ChartDataPoint; hasData: boolean } {
   const point: ChartDataPoint = { date: date.toLocaleDateString() };
   let hasData = false;
 
@@ -64,7 +79,7 @@ function buildDataPoint(
     if (sumMode) {
       let sum = 0;
       for (const version of selectedVersions) {
-        sum += versionData[version] ?? 0;
+        sum += count(versionData[version], filter);
       }
       if (sum !== 0 || hasData) {
         hasData = true;
@@ -72,14 +87,14 @@ function buildDataPoint(
       point[platformId] = sum;
     } else {
       for (const version of selectedVersions) {
-        const value = versionData[version] ?? 0;
+        const value = count(versionData[version], filter);
         if (value !== 0) hasData = true;
         point[`${platformId}_${version}`] = value;
       }
     }
   }
 
-  return hasData ? point : null;
+  return { point, hasData };
 }
 
 function buildPadding(
