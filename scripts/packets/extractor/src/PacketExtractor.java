@@ -90,7 +90,7 @@ public class PacketExtractor {
                 Map<String, Object> packet = new LinkedHashMap<>();
                 packet.put("index", index);
                 packet.put("id", entry.type().id().toString());
-                if (packetClass != null) packet.put("class", packetClass.getSimpleName());
+                if (packetClass != null) packet.put("class", nestedName(packetClass));
 
                 Map<String, Object> body;
                 try {
@@ -110,12 +110,45 @@ public class PacketExtractor {
 
         output.put("protocols", protocols);
         output.put("types", CodecWalker.TYPES);
+        unifyEnums(output);
 
         Gson gson = pretty ? new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create()
                 : new GsonBuilder().disableHtmlEscaping().create();
         Files.writeString(Path.of(outputPath), gson.toJson(output), StandardCharsets.UTF_8);
+        int dangling = danglingRefs(output, CodecWalker.TYPES.keySet());
         System.err.println("[extractor] wrote " + outputPath + ": " + total + " packets, "
-                + CodecWalker.TYPES.size() + " shared types, " + opaque + " opaque");
+                + CodecWalker.TYPES.size() + " shared types, " + opaque + " opaque, " + dangling + " dangling refs");
+    }
+
+    /** Refs naming no shared type — each one is a broken link on the page; must be 0. */
+    @SuppressWarnings("unchecked")
+    static int danglingRefs(Object node, java.util.Set<String> types) {
+        int n = 0;
+        if (node instanceof Map<?, ?> m) {
+            if ("ref".equals(m.get("kind")) && !types.contains(m.get("ref"))) {
+                System.err.println("[extractor] DANGLING ref " + m.get("ref"));
+                n++;
+            }
+            for (Object v : m.values()) n += danglingRefs(v, types);
+        } else if (node instanceof List<?> l) {
+            for (Object v : l) n += danglingRefs(v, types);
+        }
+        return n;
+    }
+
+    /** Traced readEnum values ("Enum" wire) become the same enum node composite codecs produce. */
+    @SuppressWarnings("unchecked")
+    static void unifyEnums(Object node) {
+        if (node instanceof Map<?, ?> m) {
+            Map<String, Object> n = (Map<String, Object>) m;
+            if ("value".equals(n.get("kind")) && "Enum".equals(n.get("wire")) && n.containsKey("values")) {
+                n.put("kind", "enum");
+                n.put("wire", "VarInt");
+            }
+            for (Object v : n.values()) unifyEnums(v);
+        } else if (node instanceof List<?> l) {
+            for (Object v : l) unifyEnums(v);
+        }
     }
 
     /* ── registries ─────────────────────────────────────── */
@@ -129,18 +162,48 @@ public class PacketExtractor {
             CloseableResourceManager resources = new MultiPackResourceManager(PackType.SERVER_DATA, repo.openAllSelected());
             LayeredRegistryAccess<RegistryLayer> layers = RegistryLayer.createRegistryAccess();
             List<Registry.PendingTags<?>> tags = TagLoader.loadTagsForExistingRegistries(resources, layers.getLayer(RegistryLayer.STATIC));
-            RegistryAccess.Frozen loadContext = layers.getAccessForLoading(RegistryLayer.WORLDGEN);
+            // 26.3 renamed the worldgen layer to WORLD — resolve by name so older 26.x jars still work
+            RegistryLayer worldLayer = enumByName(RegistryLayer.class, "WORLD", "WORLDGEN");
+            RegistryAccess.Frozen loadContext = layers.getAccessForLoading(worldLayer);
             List<HolderLookup.RegistryLookup<?>> lookups = TagLoader.buildUpdatedLookups(loadContext, tags);
-            RegistryAccess.Frozen worldgen = RegistryDataLoader.load(resources, lookups, RegistryDataLoader.WORLDGEN_REGISTRIES, Runnable::run).join();
+            RegistryAccess.Frozen worldgen = RegistryDataLoader.load(resources, lookups,
+                    staticList(RegistryDataLoader.class, "WORLD_REGISTRIES", "WORLDGEN_REGISTRIES"), Runnable::run).join();
             List<HolderLookup.RegistryLookup<?>> dimensionLookups = Stream.concat(lookups.stream(), worldgen.listRegistries()).toList();
             RegistryAccess.Frozen dimensions = RegistryDataLoader.load(resources, dimensionLookups, RegistryDataLoader.DIMENSION_REGISTRIES, Runnable::run).join();
-            RegistryAccess full = layers.replaceFrom(RegistryLayer.WORLDGEN, worldgen, dimensions).compositeAccess();
+            RegistryAccess full = layers.replaceFrom(worldLayer, worldgen, dimensions).compositeAccess();
             System.err.println("[extractor] loaded full registry access (with data-driven registries)");
+            try {
+                // items' default components are bound at reload; decoding an ItemStack
+                // (merchant offers trace one) needs them
+                BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(full).forEach(p -> p.apply());
+            } catch (Throwable t) {
+                System.err.println("[extractor] FAILED to bind default components: " + t);
+            }
             return full;
         } catch (Throwable t) {
             System.err.println("[extractor] falling back to static registries: " + t);
             return RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY);
         }
+    }
+
+    static <E extends Enum<E>> E enumByName(Class<E> cls, String... names) {
+        for (String name : names) {
+            for (E constant : cls.getEnumConstants()) {
+                if (constant.name().equals(name)) return constant;
+            }
+        }
+        throw new IllegalStateException(cls.getSimpleName() + " has none of " + List.of(names));
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T> List<T> staticList(Class<?> owner, String... names) throws ReflectiveOperationException {
+        for (String name : names) {
+            try {
+                return (List<T>) owner.getField(name).get(null);
+            } catch (NoSuchFieldException ignored) {
+            }
+        }
+        throw new NoSuchFieldException(owner.getSimpleName() + " has none of " + List.of(names));
     }
 
     /* ── jar scanning ───────────────────────────────────── */
@@ -188,7 +251,9 @@ public class PacketExtractor {
                         if (packetClass != null) PACKET_TYPE_TO_CLASS.put(value, packetClass);
                     }
                 } else {
-                    String label = nestedName(cl) + "." + f.getName();
+                    // anonymous holders (StyledFormat$1, a NumberFormatType) label as their outer class
+                    Class<?> owner = cl.isAnonymousClass() && cl.getEnclosingClass() != null ? cl.getEnclosingClass() : cl;
+                    String label = nestedName(owner) + "." + f.getName();
                     CODEC_CONSTANT_NAMES.putIfAbsent(value, label);
                     CODEC_BY_LABEL.putIfAbsent(label, value);
                 }

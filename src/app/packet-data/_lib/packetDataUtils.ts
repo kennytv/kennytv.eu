@@ -74,7 +74,7 @@ export const FLOW_LABELS: Record<string, string> = {
 export const WIRE_ENCODINGS: Record<string, string> = {
   VarInt: '1–5 bytes of 7 bits each, least significant first; the high bit of a byte signals that another follows',
   VarLong: '1–10 bytes of 7 bits each, least significant first; the high bit of a byte signals that another follows',
-  String: 'VarInt byte length, then UTF-8 bytes',
+  String: 'VarInt byte length, then UTF-8 bytes; at most 32767 characters unless a max is shown',
   Identifier: 'String of the form namespace:path (namespace defaults to minecraft)',
   'JSON (String)': 'String containing JSON',
   UUID: 'two Longs: most significant half, then least significant half',
@@ -102,6 +102,11 @@ export const WIRE_ENCODINGS: Record<string, string> = {
   Double: 'eight bytes, IEEE 754',
   Enum: 'VarInt ordinal of the constant, unless noted otherwise',
   'Public Key': 'VarInt length, then DER-encoded key bytes',
+  Bytes: 'raw bytes with no length prefix; ×n gives the count',
+  'Raw Bytes': 'raw bytes with no length prefix',
+  'Container ID': 'VarInt window id',
+  Vector3f: 'three Floats: x, y, z',
+  Quaternion: 'four Floats: x, y, z, w',
   'Registry Key': 'Identifier',
   'Resource Key': 'Identifier',
 };

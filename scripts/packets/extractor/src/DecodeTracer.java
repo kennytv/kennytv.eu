@@ -38,8 +38,18 @@ public class DecodeTracer {
     }
 
     /** Result of a trace: the reconstructed node plus the decoded object (for naming). */
-    record TraceOutcome(Object result, List<Event> events, Throwable failure, List<String> fabricatedStrings) {
+    record TraceOutcome(Object result, List<Event> events, Throwable failure, List<String> fabricatedStrings,
+                        StreamCodec<?, ?> codec, Policy template) {
         boolean ok() { return failure == null; }
+
+        /** Replay this decode with the read that became {@code eventIndex} given another value. */
+        TraceOutcome perturbed(int eventIndex, long value, boolean literal) {
+            Policy p = template.copy();
+            p.perturbEvent = eventIndex;
+            p.perturbValue = value;
+            p.perturbLiteral = literal;
+            return run(codec, p);
+        }
     }
 
     static RegistryAccess registryAccess;
@@ -83,12 +93,36 @@ public class DecodeTracer {
         /** Single bit to set in the first EnumSet read (action-set exploration). */
         int enumSetBit = -1;
         private boolean enumSetUsed;
+        /** Read (by event index) to answer with {@link #perturbValue} instead (field-name probing). */
+        int perturbEvent = -1;
+        long perturbValue;
+        /** Fixed-width reads take {@link #perturbValue} as-is (id probing) instead of a float-safe pattern. */
+        boolean perturbLiteral;
+        /** Byte arrays carry a valid RSA key (ByteBufCodecs.PUBLIC_KEY maps a plain byte array). */
+        boolean keyArrays;
         private int pendingVarint = -1; // multi-byte varint in progress
         private int lastVarintValue;
+        private boolean lastVarintPerturbed;
 
         Policy(int varintValue, boolean booleansTrue) {
             this.varintValue = varintValue;
             this.booleansTrue = booleansTrue;
+        }
+
+        /** A fresh policy with the same configuration (scripts included), for replays. */
+        Policy copy() {
+            Policy p = new Policy(varintValue, booleansTrue);
+            p.nbtTextCompound = nbtTextCompound;
+            p.enumChoice = enumChoice;
+            p.byteChoice = byteChoice;
+            p.enumSetBit = enumSetBit;
+            p.varintScript.addAll(varintScript);
+            p.keyArrays = keyArrays;
+            return p;
+        }
+
+        boolean perturbingNow() {
+            return perturbEvent >= 0 && events.size() == perturbEvent;
         }
 
         private byte nextVarintByte(StackTraceElement[] stack) {
@@ -97,10 +131,18 @@ public class DecodeTracer {
                 value = pendingVarint;
             } else {
                 boolean enumRead = hasFrameMethod(stack, "readEnum");
-                if (enumChoice >= 0 && !enumChoiceUsed && enumRead) {
+                lastVarintPerturbed = false;
+                if (perturbingNow()) {
+                    // consume what the base run would have, so later reads stay aligned
+                    if (enumChoice >= 0 && !enumChoiceUsed && enumRead) enumChoiceUsed = true;
+                    else if (!enumRead && !hasFrame(stack, "Utf8String", "read") && !varintScript.isEmpty()) varintScript.poll();
+                    value = (int) perturbValue;
+                    lastVarintPerturbed = true;
+                } else if (enumChoice >= 0 && !enumChoiceUsed && enumRead) {
                     enumChoiceUsed = true;
                     value = enumChoice;
-                } else if (hasFrameMethod(stack, "readPublicKey") || hasFrame(stack, ".Crypt", "byteToPublicKey")) {
+                } else if (hasFrameMethod(stack, "readPublicKey") || hasFrame(stack, ".Crypt", "byteToPublicKey")
+                        || (keyArrays && hasFrameMethod(stack, "readByteArray"))) {
                     value = rsaPublicKeyDer().length;
                 } else if (hasFrame(stack, "Utf8String", "read")) {
                     value = 2; // two chars: room for a unique marker per string
@@ -123,6 +165,22 @@ public class DecodeTracer {
         @Override
         public void fabricate(byte[] out, StackTraceElement[] stack) {
             String ctx = stackContextKind(stack);
+            if (perturbingNow() && !ctx.equals("varint")) {
+                fabricateDefault(out, stack, ctx);
+                if (ctx.equals("boolean")) {
+                    out[0] = (byte) (out[0] == 0 ? 1 : 0);
+                } else if (ctx.equals("other")) {
+                    // distinct from the 0 fill: 5 for bytes/shorts, 3.0 as float/double bits
+                    long bits = perturbLiteral ? perturbValue
+                            : out.length == 4 ? 0x40400000L : out.length == 8 ? 0x4008000000000000L : perturbValue;
+                    for (int i = 0; i < out.length; i++) out[i] = (byte) (bits >>> (8 * (out.length - 1 - i)));
+                }
+                return;
+            }
+            fabricateDefault(out, stack, ctx);
+        }
+
+        private void fabricateDefault(byte[] out, StackTraceElement[] stack, String ctx) {
             switch (ctx) {
                 case "varint" -> out[0] = nextVarintByte(stack);
                 case "boolean" -> {
@@ -167,6 +225,8 @@ public class DecodeTracer {
             if (!"varint".equals(stackContextKind(stack))) return null;
             int v = lastVarintValue;
             if (v <= 0) return null;
+            // a perturbed length probes the reader's limit check — never materialize it
+            if (lastVarintPerturbed && v > 4096) return null;
             if (hasFrame(stack, "Utf8String", "read")) {
                 // unique marker so the field name can be recovered from the decoded object
                 int index = fabricatedStrings.size();
@@ -177,7 +237,8 @@ public class DecodeTracer {
                 fabricatedStrings.add(new String(content, java.nio.charset.StandardCharsets.US_ASCII));
                 return content;
             }
-            if (hasFrameMethod(stack, "readPublicKey") || hasFrame(stack, ".Crypt", "byteToPublicKey")) {
+            if (hasFrameMethod(stack, "readPublicKey") || hasFrame(stack, ".Crypt", "byteToPublicKey")
+                    || (keyArrays && hasFrameMethod(stack, "readByteArray"))) {
                 return rsaPublicKeyDer();
             }
             if (hasFrameMethod(stack, "readLongArray")) return new byte[v * 8];
@@ -305,15 +366,36 @@ public class DecodeTracer {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     static TraceOutcome run(StreamCodec<?, ?> codec, Policy policy) {
+        Policy template = policy.copy();
         FabricatingByteBuf fab = new FabricatingByteBuf(policy);
         RegistryFriendlyByteBuf buf = new RegistryFriendlyByteBuf(fab, registryAccess);
+        TraceOutcome out;
         try {
             Object result = decodeCall((StreamCodec) codec, buf);
-            return new TraceOutcome(result, policy.events, null, policy.fabricatedStrings);
+            out = new TraceOutcome(result, policy.events, null, policy.fabricatedStrings, codec, template);
         } catch (Throwable t) {
-            return new TraceOutcome(null, policy.events, t, policy.fabricatedStrings);
+            out = new TraceOutcome(null, policy.events, t, policy.fabricatedStrings, codec, template);
         }
+        OUTCOME_BY_EVENTS.put(policy.events, out);
+        if (!out.ok() && !template.keyArrays && mentionsPublicKey(out.failure())) {
+            // the key went through a mapped byte array the stack cannot identify: retry with
+            // every byte array holding a valid key
+            Policy retry = template.copy();
+            retry.keyArrays = true;
+            return run(codec, retry);
+        }
+        return out;
     }
+
+    static boolean mentionsPublicKey(Throwable t) {
+        for (; t != null; t = t.getCause() == t ? null : t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().toLowerCase(java.util.Locale.ROOT).contains("public key")) return true;
+        }
+        return false;
+    }
+
+    /** Which trace an event list came from — tree leaves keep a pointer back for replays. */
+    static final Map<List<Event>, TraceOutcome> OUTCOME_BY_EVENTS = new java.util.IdentityHashMap<>();
 
     /** Separate frame so trimStack can find the decode entry boundary. */
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -340,14 +422,7 @@ public class DecodeTracer {
     static TraceOutcome runScripted(StreamCodec<?, ?> codec, int firstVarint) {
         Policy policy = new Policy(0, false);
         policy.varintScript.add(firstVarint);
-        FabricatingByteBuf fab = new FabricatingByteBuf(policy);
-        RegistryFriendlyByteBuf buf = new RegistryFriendlyByteBuf(fab, registryAccess);
-        try {
-            Object result = decodeCall((StreamCodec) codec, buf);
-            return new TraceOutcome(result, policy.events, null, policy.fabricatedStrings);
-        } catch (Throwable t) {
-            return new TraceOutcome(null, policy.events, t, policy.fabricatedStrings);
-        }
+        return run(codec, policy);
     }
 
     /* ── enum branch exploration ────────────────────────── */
@@ -442,7 +517,149 @@ public class DecodeTracer {
             keys.add(String.valueOf(v));
         }
         if (outs.size() <= 1) return null;
-        return assembleBranches(outs, produced, keys.toArray(new String[0]), "switch on the preceding byte");
+        boolean bitmask = constantFamily(produced) == null && isTwoBitMask(outs, produced);
+        if (bitmask) {
+            // 0x01 and 0x02 each add their own reads, 3 adds both, 4 adds nothing: presence
+            // flags, not a switch — and 4 was only ever a probe
+            outs = outs.subList(0, 4);
+            keys = List.of("0", "1 (0x01)", "2 (0x02)", "3 (0x01 | 0x02)");
+        }
+        Map<String, Object> root = assembleBranches(outs, produced, keys.toArray(new String[0]),
+                bitmask ? "fields present per flag combination" : "switch on the preceding byte");
+        if (root == null) return null;
+        if (bitmask) {
+            Map<String, Object> keyNode = lastByteBeforeDispatch(root);
+            if (keyNode != null) {
+                keyNode.put("name", "flags");
+                keyNode.remove("java");
+                keyNode.put("note", "0x01 and 0x02 each mark an optional field as present");
+            }
+        } else {
+            relabelByteSwitch(root, produced);
+        }
+        return root;
+    }
+
+    /** Probe bodies 0..4 behave like two independent presence bits. */
+    static boolean isTwoBitMask(List<TraceOutcome> outs, Class<?> produced) {
+        if (outs.size() != 5) return false;
+        List<List<Unit>> ul = new ArrayList<>();
+        for (TraceOutcome out : outs) ul.add(toUnits(out.events(), produced));
+        int prefix = commonPrefix(ul);
+        int tail = commonSuffix(ul, prefix);
+        List<List<String>> bodies = new ArrayList<>();
+        for (List<Unit> u : ul) {
+            List<String> wires = new ArrayList<>();
+            for (Unit unit : u.subList(prefix, u.size() - tail)) wires.add(unit.wire);
+            bodies.add(wires);
+        }
+        List<String> both = new ArrayList<>(bodies.get(1));
+        both.addAll(bodies.get(2));
+        return bodies.get(0).isEmpty() && bodies.get(4).isEmpty()
+                && !bodies.get(1).isEmpty() && !bodies.get(2).isEmpty() && both.equals(bodies.get(3));
+    }
+
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> lastByteBeforeDispatch(Map<String, Object> root) {
+        Map<String, Object> keyNode = null;
+        for (Object f : (List<Object>) root.get("fields")) {
+            Map<String, Object> node = asMap(f);
+            if (node == null) continue;
+            if ("dispatch".equals(node.get("kind"))) return keyNode;
+            if ("value".equals(node.get("kind")) && ("Byte".equals(node.get("wire")) || "Unsigned Byte".equals(node.get("wire")))) {
+                keyNode = node;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The probe tried 0..4 blindly; the packet class's own int constants say which values
+     * exist. A family of powers of two (HAS_SOURCE=1, HAS_SOUND=2) is a bitmask: the byte is
+     * named flags and only combinations of its bits remain. Otherwise (METHOD_ADD=0, ...) the
+     * keys are the constants and probe values without one are dropped.
+     */
+    @SuppressWarnings("unchecked")
+    static void relabelByteSwitch(Map<String, Object> root, Class<?> produced) {
+        Map<Integer, String> family = constantFamily(produced);
+        if (family == null) return;
+        boolean bitmask = !family.containsKey(0) && family.keySet().stream().allMatch(v -> Integer.bitCount(v) == 1);
+        int allBits = family.keySet().stream().mapToInt(Integer::intValue).reduce(0, (a, b) -> a | b);
+        Map<String, Object> dispatch = null;
+        Map<String, Object> keyNode = null;
+        for (Object f : (List<Object>) root.get("fields")) {
+            Map<String, Object> node = asMap(f);
+            if (node == null) continue;
+            if ("dispatch".equals(node.get("kind"))) {
+                dispatch = node;
+                break;
+            }
+            if ("value".equals(node.get("kind")) && ("Byte".equals(node.get("wire")) || "Unsigned Byte".equals(node.get("wire")))) {
+                keyNode = node;
+            }
+        }
+        if (dispatch == null) return;
+        List<Object> kept = new ArrayList<>();
+        for (Object v : (List<Object>) dispatch.get("variants")) {
+            Map<String, Object> variant = asMap(v);
+            List<String> labels = new ArrayList<>();
+            for (String k : String.valueOf(variant.get("key")).split(", ")) {
+                int value;
+                try {
+                    value = Integer.parseInt(k);
+                } catch (NumberFormatException e) {
+                    labels.add(k);
+                    continue;
+                }
+                if (bitmask) {
+                    if ((value & ~allBits) != 0) continue;
+                    List<String> bits = new ArrayList<>();
+                    for (var e : family.entrySet()) if ((value & e.getKey()) != 0) bits.add(e.getValue());
+                    labels.add(value + (bits.isEmpty() ? "" : " (" + String.join(" | ", bits) + ")"));
+                } else if (family.containsKey(value)) {
+                    labels.add(family.get(value) + "=" + value);
+                }
+            }
+            if (labels.isEmpty()) continue;
+            variant.put("key", String.join(", ", labels));
+            kept.add(variant);
+        }
+        dispatch.put("variants", kept);
+        if (keyNode != null) {
+            if (bitmask) {
+                keyNode.putIfAbsent("name", "flags");
+                List<String> bits = new ArrayList<>();
+                for (var e : family.entrySet()) bits.add(String.format("0x%02x: %s", e.getKey(), e.getValue()));
+                keyNode.put("note", String.join(", ", bits));
+                dispatch.put("note", "fields present per flag combination");
+            } else {
+                keyNode.put("values", family.entrySet().stream().map(e -> e.getValue() + "=" + e.getKey()).toList());
+            }
+        }
+    }
+
+    /** The class's static final int constants in 0..255 sharing one name prefix (METHOD_*, HAS_*). */
+    static Map<Integer, String> constantFamily(Class<?> cls) {
+        if (cls == null) return null;
+        Map<String, Map<Integer, String>> byPrefix = new LinkedHashMap<>();
+        for (Field f : cls.getDeclaredFields()) {
+            int m = f.getModifiers();
+            if (!Modifier.isStatic(m) || !Modifier.isFinal(m) || (f.getType() != int.class && f.getType() != byte.class)) continue;
+            try {
+                f.setAccessible(true);
+                int v = ((Number) f.get(null)).intValue();
+                if (v < 0 || v > 255) continue;
+                int us = f.getName().indexOf('_');
+                String prefix = us > 0 ? f.getName().substring(0, us) : f.getName();
+                byPrefix.computeIfAbsent(prefix, k -> new java.util.TreeMap<>()).putIfAbsent(v, f.getName());
+            } catch (Throwable ignored) {
+            }
+        }
+        Map<Integer, String> best = null;
+        for (Map<Integer, String> family : byPrefix.values()) {
+            if (family.size() >= 2 && (best == null || family.size() > best.size())) best = family;
+        }
+        return best;
     }
 
     /**
@@ -463,7 +680,36 @@ public class DecodeTracer {
             keys.add(label);
         }
         if (outs.size() <= 1) return null;
-        return assembleBranches(outs, produced, keys.toArray(new String[0]), "one section per action in the set, in ordinal order");
+        Map<String, Object> root = assembleBranches(outs, produced, keys.toArray(new String[0]), "one section per action in the set, in ordinal order");
+        Class<?> enumClass = enumSetClass(outs.getFirst().result());
+        if (root != null && enumClass != null) {
+            forEachNode(root, n -> {
+                if ("EnumSet".equals(n.get("wire")) && !n.containsKey("values")) {
+                    List<String> names = new ArrayList<>();
+                    for (Object c : enumClass.getEnumConstants()) names.add(((Enum<?>) c).name());
+                    n.put("values", names);
+                    n.put("java", "EnumSet<" + enumClass.getSimpleName() + ">");
+                    n.put("note", "bit n set = constant n is in the set");
+                }
+            });
+        }
+        return root;
+    }
+
+    /** The enum class of the decoded object's single-element EnumSet field. */
+    static Class<?> enumSetClass(Object result) {
+        if (result == null) return null;
+        for (Field f : result.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers()) || !java.util.EnumSet.class.isAssignableFrom(f.getType())) continue;
+            try {
+                f.setAccessible(true);
+                if (f.get(result) instanceof java.util.EnumSet<?> set && !set.isEmpty()) {
+                    return ((Enum<?>) set.iterator().next()).getDeclaringClass();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     /** Name of the single element of the decoded packet's EnumSet field, if exactly one. */
@@ -748,7 +994,15 @@ public class DecodeTracer {
                 @SuppressWarnings("unchecked")
                 List<Object> fields = (List<Object>) l;
                 VariantValue value = variantValueClass(outs.get(i), labeling);
-                if (value != null) {
+                Map<String, Object> valueRef = value == null ? null : refProducing(fields, value.cls());
+                if (valueRef != null) {
+                    // a spliced shared type decodes the whole value (set_player_team's Parameters)
+                    if (value.fieldName() != null) valueRef.putIfAbsent("name", value.fieldName());
+                    if (packetReads) {
+                        Class<?> packetClass = outs.get(i).result() == null ? null : outs.get(i).result().getClass();
+                        nameUnclaimedVariantFields(fields, packetClass, null);
+                    }
+                } else if (value != null) {
                     // a single structured group in the body IS the variant's value field
                     Map<String, Object> soleGroup = soleStructuredChild(fields);
                     if (soleGroup != null) {
@@ -766,6 +1020,12 @@ public class DecodeTracer {
                         if (!nameUnclaimedVariantFields(fields, value.cls(), soleGroup) && packetReads) {
                             Class<?> packetClass = outs.get(i).result() == null ? null : outs.get(i).result().getClass();
                             nameUnclaimedVariantFields(fields, packetClass, null);
+                        }
+                        // the value's own group as the body's only member is a redundant level
+                        if (fields.size() == 1 && fields.getFirst() == soleGroup
+                                && soleGroup.get("fields") instanceof List<?> inner && !"Dispatch".equals(soleGroup.get("context"))) {
+                            body.put("java", soleGroup.get("java"));
+                            body.put("fields", new ArrayList<>((List<Object>) inner));
                         }
                     } else {
                         nameChildren(fields, value.cls());
@@ -792,8 +1052,26 @@ public class DecodeTracer {
             variants.add(variant);
         }
         if (!anyBody) return null;
-        List<Object> merged = CodecWalker.mergeVariants(variants);
-        return merged.size() <= 1 ? null : merged;
+        // merged only after replay naming (mergeTracedVariants): bodies that look alike now may
+        // still name different fields (number parsers' min vs max)
+        return CodecWalker.mergeVariants(copyVariants(variants)).size() <= 1 ? null : variants;
+    }
+
+    @SuppressWarnings("unchecked")
+    static List<Object> copyVariants(List<Object> variants) {
+        List<Object> out = new ArrayList<>();
+        for (Object v : variants) out.add(copyTree(v));
+        return out;
+    }
+
+    /** Merge identical variant bodies throughout a finished traced tree. */
+    @SuppressWarnings("unchecked")
+    static void mergeTracedVariants(Map<String, Object> tree) {
+        forEachNode(tree, n -> {
+            if ("dispatch".equals(n.get("kind")) && n.get("variants") instanceof List<?> l) {
+                n.put("variants", CodecWalker.mergeVariants((List<Object>) l));
+            }
+        });
     }
 
     static boolean hasAnyName(List<Object> fields) {
@@ -837,6 +1115,20 @@ public class DecodeTracer {
 
     record VariantValue(Class<?> cls, String fieldName) {}
 
+    /** The one ref child whose shared type decodes to (a subtype of) {@code cls}. */
+    static Map<String, Object> refProducing(List<Object> fields, Class<?> cls) {
+        Map<String, Object> found = null;
+        for (Object f : fields) {
+            Map<String, Object> node = asMap(f);
+            if (node == null || !"ref".equals(node.get("kind"))) continue;
+            Class<?> produced = CodecWalker.TYPE_CLASSES.get(String.valueOf(node.get("ref")));
+            if (produced == null || !cls.isAssignableFrom(produced)) continue;
+            if (found != null) return null;
+            found = node;
+        }
+        return found;
+    }
+
     /** The single group/container child among plain values, if any. */
     @SuppressWarnings("unchecked")
     static Map<String, Object> soleStructuredChild(List<Object> fields) {
@@ -863,7 +1155,10 @@ public class DecodeTracer {
             if (labeling != null && labeling.field() != null) {
                 Object value = labeling.field().get(result);
                 if (value instanceof java.util.Optional<?> opt) value = opt.orElse(null);
-                if (value != null) return new VariantValue(value.getClass(), labeling.field().getName());
+                // a switch key (set_objective's method int) is not the variant's value
+                if (value != null && !value.getClass().getName().startsWith("java.") && !(value instanceof Enum<?>)) {
+                    return new VariantValue(value.getClass(), labeling.field().getName());
+                }
             }
             for (Field f : result.getClass().getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers())) continue;
@@ -1092,8 +1387,9 @@ public class DecodeTracer {
         Object first = outs.getFirst().result();
         if (first == null) return null;
         VariantLabeling byClass = null;
-        for (Field f : first.getClass().getDeclaredFields()) {
-            if (Modifier.isStatic(f.getModifiers())) continue;
+        // the whole hierarchy: subclass-per-variant values keep their kind in a superclass
+        // field (TrackedWaypoint.type)
+        for (Field f : instanceFields(first.getClass())) {
             try {
                 f.setAccessible(true);
                 String[] labels = new String[outs.size()];
@@ -1122,7 +1418,15 @@ public class DecodeTracer {
             } catch (Throwable ignored) {
             }
         }
+        // polymorphic values (boss_event's AddOperation, ...) usually expose their kind
+        // through an enum accessor on the shared supertype (Operation#getType)
+        if (byClass != null && byClass.field() != null) {
+            VariantLabeling byAccessor = accessorLabels(outs, byClass.field());
+            if (byAccessor != null) return byAccessor;
+        }
         if (byClass == null) {
+            VariantLabeling byAccessor = accessorLabels(outs, null);
+            if (byAccessor != null) return byAccessor;
             // subclass-per-variant packets (TrackedWaypoint): the decoded objects' own
             // classes label the variants when no single field distinguishes them
             String[] labels = new String[outs.size()];
@@ -1135,6 +1439,49 @@ public class DecodeTracer {
             if (distinct.size() == outs.size()) return new VariantLabeling(labels, null, null, null);
         }
         return byClass;
+    }
+
+    /**
+     * Labels from a no-arg enum accessor declared on a supertype shared by every variant's
+     * value (the field's value, or the decoded object itself when {@code field} is null),
+     * when it tells all variants apart.
+     */
+    static VariantLabeling accessorLabels(List<TraceOutcome> outs, Field field) {
+        List<Object> values = new ArrayList<>();
+        try {
+            for (TraceOutcome out : outs) {
+                Object v = out.result() == null ? null : field == null ? out.result() : field.get(out.result());
+                if (v instanceof java.util.Optional<?> opt) v = opt.orElse(null);
+                if (v == null) return null;
+                values.add(v);
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        for (java.lang.reflect.Method m : values.getFirst().getClass().getMethods()) {
+            if (m.getParameterCount() != 0 || !m.getReturnType().isEnum()
+                    || !m.getDeclaringClass().getName().startsWith("net.minecraft")) {
+                continue;
+            }
+            try {
+                // every value's class implements the accessor (Operation#getType lives on each
+                // private implementation, so match by name rather than declaring class)
+                String[] labels = new String[values.size()];
+                java.util.Set<String> distinct = new java.util.HashSet<>();
+                for (int i = 0; i < values.size(); i++) {
+                    java.lang.reflect.Method own = values.get(i).getClass().getMethod(m.getName());
+                    if (own.getReturnType() != m.getReturnType()) throw new NoSuchMethodException();
+                    own.setAccessible(true);
+                    labels[i] = ((Enum<?>) own.invoke(values.get(i))).name();
+                    distinct.add(labels[i]);
+                }
+                if (distinct.size() == values.size()) {
+                    return new VariantLabeling(labels, m.getReturnType(), field != null ? field.getName() : null, field);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     /**
@@ -1188,30 +1535,104 @@ public class DecodeTracer {
     static void applyHandPatches(Map<String, Object> tree, Class<?> produced) {
         if (produced == null) return;
         switch (PacketExtractor.nestedName(produced)) {
-            case "ClientboundUpdateAdvancementsPacket" -> patchDisplayInfo(tree);
+            case "DisplayInfo" -> patchDisplayInfo(tree);
             case "ClientboundBossEventPacket" -> patchFlagBytes(tree, 2,
-                    "bit 1: darken screen, bit 2: play boss music, bit 4: create world fog");
+                    "0x01: darken screen, 0x02: play boss music, 0x04: create world fog");
             case "ServerboundSetStructureBlockPacket" -> patchStructureBlock(tree);
             case "ServerboundMovePlayerPacket.Pos", "ServerboundMovePlayerPacket.PosRot",
                  "ServerboundMovePlayerPacket.Rot", "ServerboundMovePlayerPacket.StatusOnly" ->
-                    patchFlagByte(tree, "bit 1: on ground, bit 2: horizontal collision");
+                    patchFlagByte(tree, "0x01: on ground, 0x02: horizontal collision");
             case "ServerboundSetCommandBlockPacket" ->
-                    patchFlagByte(tree, "bit 1: track output, bit 2: conditional, bit 4: automatic");
+                    patchFlagByte(tree, "0x01: track output, 0x02: conditional, 0x04: automatic");
             case "ClientboundPlayerAbilitiesPacket" ->
-                    patchFlagByte(tree, "bit 1: invulnerable, bit 2: flying, bit 4: may fly, bit 8: instabuild (creative)");
+                    patchFlagByte(tree, "0x01: invulnerable, 0x02: flying, 0x04: may fly, 0x08: instabuild (creative)");
             case "ServerboundPlayerAbilitiesPacket" ->
-                    patchFlagByte(tree, "bit 2: flying; other bits are ignored");
+                    patchFlagByte(tree, "0x02: flying; other bits are ignored");
             case "ClientboundDamageEventPacket" -> patchDamageEvent(tree);
-            case "ClientboundCustomQueryPacket" -> patchCustomQuery(tree);
             case "ClientboundPlayerInfoUpdatePacket" -> patchPlayerInfo(tree);
             case "DiscardedPayload" -> patchDiscardedPayload(tree);
-            case "ClientboundSetObjectivePacket" -> patchNumberFormat(tree);
+            case "ClientboundMoveEntityPacket.Pos", "ClientboundMoveEntityPacket.PosRot" -> patchMoveEntity(tree);
+            case "ServerboundCustomQueryAnswerPacket" -> patchCustomQueryAnswer(tree);
             default -> { }
         }
     }
 
-    /** player_info_update ADD_PLAYER: the game profile's name and property list. */
+    /**
+     * move_entity_pos(_rot): the second VarInt packs on-ground and a step count, and VecDelta
+     * reads either one short triple (no steps) or a ticks+triple per step.
+     */
     @SuppressWarnings("unchecked")
+    static void patchMoveEntity(Map<String, Object> tree) {
+        List<Object> fields = (List<Object>) tree.get("fields");
+        int deltaAt = -1;
+        boolean hasVecDelta = false;
+        for (int i = 0; i < fields.size(); i++) {
+            Map<String, Object> n = asMap(fields.get(i));
+            hasVecDelta |= "VecDelta".equals(n.get("context"));
+            if ("group".equals(n.get("kind")) && "VecDelta".equals(n.get("context"))
+                    && n.get("fields") instanceof List<?> l && l.size() == 3) {
+                deltaAt = i;
+            }
+        }
+        if (!hasVecDelta) return; // before 26.3: three plain shorts, nothing packed
+        if (deltaAt < 1 || !"VarInt".equals(asMap(fields.get(deltaAt - 1)).get("wire"))) {
+            System.err.println("[patch] move-entity patch missed the VecDelta");
+            return;
+        }
+        Map<String, Object> properties = asMap(fields.get(deltaAt - 1));
+        properties.put("name", "properties");
+        properties.put("java", "int");
+        properties.put("note", "0x01: on ground; properties >> 1 = step count");
+        List<Object> triple = (List<Object>) asMap(fields.get(deltaAt)).get("fields");
+
+        Map<String, Object> step = new LinkedHashMap<>();
+        step.put("kind", "container");
+        step.put("name", "steps");
+        step.put("java", "DeltaStep");
+        step.put("note", "repeated step count times");
+        List<Object> stepFields = new ArrayList<>();
+        stepFields.add(new LinkedHashMap<>(Map.of("kind", "value", "wire", "VarInt", "name", "ticks", "java", "int")));
+        for (Object t : triple) stepFields.add(copyTree(t));
+        step.put("fields", stepFields);
+
+        Map<String, Object> dispatch = new LinkedHashMap<>();
+        dispatch.put("kind", "dispatch");
+        dispatch.put("name", "delta");
+        dispatch.put("java", "VecDelta");
+        dispatch.put("note", "switch on the step count; deltas are in 1/4096 blocks");
+        dispatch.put("variants", List.of(
+                Map.of("key", "0 (linear)", "body", new LinkedHashMap<>(Map.of("kind", "container", "java", "Linear", "fields", triple))),
+                Map.of("key", "1 or more (stepped)", "body", new LinkedHashMap<>(Map.of("kind", "container", "java", "Stepped", "fields", List.of(step))))));
+        fields.set(deltaAt, dispatch);
+    }
+
+    /**
+     * custom_query_answer: the writer sends the payload with writeNullable, but vanilla's reader
+     * skips the rest of the packet unparsed, so tracing never sees the presence Boolean.
+     */
+    @SuppressWarnings("unchecked")
+    static void patchCustomQueryAnswer(Map<String, Object> tree) {
+        List<Object> fields = (List<Object>) tree.get("fields");
+        for (int i = 0; i < fields.size(); i++) {
+            Map<String, Object> node = asMap(fields.get(i));
+            if (!"Raw Bytes".equals(node.get("wire"))) continue;
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("kind", "value");
+            data.put("wire", "Raw Bytes");
+            data.put("note", "payload data, the rest of the packet (at most 1048576 bytes)");
+            Map<String, Object> optional = new LinkedHashMap<>();
+            optional.put("kind", "optional");
+            optional.put("name", "payload");
+            optional.put("note", "written with writeNullable (vanilla clients send false); "
+                    + "the vanilla server skips everything after the transaction id unparsed");
+            optional.put("inner", data);
+            fields.set(i, optional);
+            return;
+        }
+        System.err.println("[patch] custom-query-answer patch missed the payload");
+    }
+
+    /** player_info_update ADD_PLAYER: the game profile's name and property map, read into locals. */
     static void patchPlayerInfo(Map<String, Object> tree) {
         boolean[] done = {false};
         forEachNode(tree, n -> {
@@ -1223,17 +1644,12 @@ public class DecodeTracer {
             Map<String, Object> name = asMap(l.get(0));
             Map<String, Object> properties = asMap(l.get(1));
             if (name == null || !"String".equals(name.get("wire"))
-                    || properties == null || !"list".equals(properties.get("kind"))) {
+                    || properties == null || !"ref".equals(properties.get("kind"))) {
                 return;
             }
             name.put("name", "name");
             properties.put("name", "properties");
-            Map<String, Object> elem = asMap(properties.get("elem"));
-            if (elem != null && elem.get("fields") instanceof List<?> el && el.size() == 3) {
-                asMap(el.get(0)).put("name", "name");
-                asMap(el.get(1)).put("name", "value");
-                asMap(el.get(2)).put("name", "signature");
-            }
+            properties.put("java", "PropertyMap");
             done[0] = true;
         });
         if (!done[0]) System.err.println("[patch] player-info patch missed the ADD_PLAYER profile");
@@ -1254,25 +1670,6 @@ public class DecodeTracer {
         System.err.println("[patch] discarded-payload patch missed");
     }
 
-    /** set_objective's unexplored number-format dispatch: key ids and payload. */
-    static void patchNumberFormat(Map<String, Object> tree) {
-        boolean[] done = {false};
-        forEachNode(tree, n -> {
-            if (!"group".equals(n.get("kind")) || !"Dispatch".equals(n.get("context"))
-                    || !(n.get("fields") instanceof List<?> l) || l.size() != 2) {
-                return;
-            }
-            Map<String, Object> key = asMap(l.get(0));
-            Map<String, Object> value = asMap(l.get(1));
-            if (key == null || !"VarInt".equals(key.get("wire")) || value == null) return;
-            key.put("name", "format");
-            key.put("note", "number format type: 0 = blank, 1 = styled, 2 = fixed");
-            value.put("note", "styled: a style compound; fixed: a text component; blank: nothing follows");
-            done[0] = true;
-        });
-        if (!done[0]) System.err.println("[patch] number-format patch missed");
-    }
-
     /** Names the packet's single boolean-packed byte and documents its bits. */
     static void patchFlagByte(Map<String, Object> tree, String note) {
         int[] seen = {0};
@@ -1281,7 +1678,9 @@ public class DecodeTracer {
                     && ("Byte".equals(n.get("wire")) || "Unsigned Byte".equals(n.get("wire")))
                     && n.get("x") == null) {
                 if (seen[0]++ == 0) {
-                    n.putIfAbsent("name", "flags");
+                    // the byte packs several booleans: no single field (abilities, isFlying) is it
+                    n.put("name", "flags");
+                    n.remove("java");
                     n.put("note", note);
                 }
             }
@@ -1333,56 +1732,25 @@ public class DecodeTracer {
         }
     }
 
-    /** custom_query: the payload's identifier read into a local. */
-    static void patchCustomQuery(Map<String, Object> tree) {
-        boolean[] done = {false};
-        forEachNode(tree, n -> {
-            if ("value".equals(n.get("kind")) && "Identifier".equals(n.get("wire")) && n.get("name") == null) {
-                n.put("name", "identifier");
-                done[0] = true;
-            }
-        });
-        if (!done[0]) System.err.println("[patch] custom-query patch missed the identifier");
-    }
-
-    /** DisplayInfo.fromNetwork: flag int gating a background identifier, then x and y floats on one line. */
+    /** DisplayInfo.fromNetwork: a flag int packing three booleans, the first gating a background identifier. */
     @SuppressWarnings("unchecked")
     static void patchDisplayInfo(Map<String, Object> tree) {
-        List<Map<String, Object>> groups = new ArrayList<>();
-        forEachNode(tree, n -> {
-            if ("group".equals(n.get("kind")) && "DisplayInfo.fromNetwork".equals(n.get("context"))) groups.add(n);
-        });
-        boolean flagsDone = false, xyDone = false;
-        for (Map<String, Object> group : groups) {
-            if (!(group.get("fields") instanceof List<?> l)) continue;
-            List<Object> fields = (List<Object>) l;
-            for (int i = 0; i < fields.size(); i++) {
-                Map<String, Object> node = asMap(fields.get(i));
-                if (node == null || !"value".equals(node.get("kind"))) continue;
-                if (!flagsDone && "Int".equals(node.get("wire")) && node.get("name") == null) {
-                    node.put("name", "flags");
-                    node.put("java", "int");
-                    node.put("note", "bit 1: a background follows, bit 2: show toast, bit 4: hidden");
-                    Map<String, Object> background = new LinkedHashMap<>();
-                    background.put("kind", "value");
-                    background.put("wire", "Identifier");
-                    background.put("name", "background");
-                    background.put("note", "only present when bit 1 of flags is set");
-                    fields.add(++i, background);
-                    flagsDone = true;
-                } else if (!xyDone && "Float".equals(node.get("wire")) && Integer.valueOf(2).equals(node.get("x"))) {
-                    node.remove("x");
-                    node.put("name", "x");
-                    Map<String, Object> y = new LinkedHashMap<>(node);
-                    y.put("name", "y");
-                    fields.add(i + 1, y);
-                    xyDone = true;
-                }
-            }
+        List<Object> fields = (List<Object>) tree.get("fields");
+        for (int i = 0; i < fields.size(); i++) {
+            Map<String, Object> node = asMap(fields.get(i));
+            if (node == null || !"value".equals(node.get("kind")) || !"Int".equals(node.get("wire")) || node.get("name") != null) continue;
+            node.put("name", "flags");
+            node.put("java", "int");
+            node.put("note", "0x01: a background follows, 0x02: show toast, 0x04: hidden");
+            Map<String, Object> background = new LinkedHashMap<>();
+            background.put("kind", "value");
+            background.put("wire", "Identifier");
+            background.put("name", "background");
+            background.put("note", "only present when flags & 0x01");
+            fields.add(i + 1, background);
+            return;
         }
-        if (!flagsDone || !xyDone) {
-            System.err.println("[patch] MISSED DisplayInfo patch (flags=" + flagsDone + ", xy=" + xyDone + ")");
-        }
+        System.err.println("[patch] MISSED DisplayInfo flags");
     }
 
     /** Boolean-packed bytes read into several fields (boss_event's darkenScreen/playMusic/createWorldFog). */
@@ -1409,19 +1777,15 @@ public class DecodeTracer {
         boolean flags = false;
         for (Object f : (List<Object>) l) {
             Map<String, Object> node = asMap(f);
-            if (node == null || !"value".equals(node.get("kind")) || !"Byte".equals(node.get("wire"))
-                    || node.get("name") != null) {
-                continue;
-            }
+            if (node == null || !"value".equals(node.get("kind")) || !"Byte".equals(node.get("wire"))) continue;
             if (Integer.valueOf(3).equals(node.get("x"))) {
-                node.put("name", vecs == 0 ? "offset" : "size");
-                node.put("java", vecs == 0 ? "BlockPos" : "Vec3i");
+                node.putIfAbsent("name", vecs == 0 ? "offset" : "size");
                 node.put("note", vecs == 0 ? "x, y, z as one byte each, clamped to -48..48"
                         : "x, y, z as one byte each, clamped to 0..48");
                 vecs++;
             } else if (node.get("x") == null) {
-                node.put("name", "flags");
-                node.put("note", "bit 1: ignore entities, bit 2: show air, bit 4: show bounding box, bit 8: strict");
+                node.putIfAbsent("name", "flags");
+                node.put("note", "0x01: ignore entities, 0x02: show air, 0x04: show bounding box, 0x08: strict");
                 flags = true;
             }
         }
@@ -1624,7 +1988,8 @@ public class DecodeTracer {
             Map.entry("Resource Location", "Identifier"),
             Map.entry("Instant", "Long (Instant)"),
             Map.entry("Block Hit Result", "BlockHitResult"),
-            Map.entry("Int Id List", "VarInt List"));
+            Map.entry("Int Id List", "VarInt List"),
+            Map.entry("By Id", "VarInt"));
 
     static String prettifyReadMethod(String m) {
         String base = m.substring(4); // strip "read"
@@ -1650,11 +2015,109 @@ public class DecodeTracer {
         return treeFromUnits(toUnits(events, rootClass), rootClass);
     }
 
+    /* ── call-site codec splicing ───────────────────────── */
+
+    /** Codecs spliced into traced trees; a unit's wire "codec:<i>" indexes this list. */
+    static final List<Object> SPLICED = new ArrayList<>();
+    static final Map<Object, Integer> SPLICE_IDS = new java.util.IdentityHashMap<>();
+    static final Map<Object, Map<String, Object>> SPLICE_NODES = new java.util.IdentityHashMap<>();
+    /** Codecs whose splice node is being walked right now (recursive types trace themselves). */
+    static final java.util.Set<Object> SPLICING = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    static final Map<String, Boolean> CODEC_CLASSES = new HashMap<>();
+
+    record Splice(int frameIndex, int id) {}
+
+    /**
+     * The outermost codec a game-class reader invokes on this event's path, resolved from the
+     * bytecode at the call site ({@code SoundEvent.STREAM_CODEC.decode(input)}); the reads
+     * below it are that codec's business and get the walker's exact node instead.
+     */
+    static Splice spliceFor(List<Frame> ctx) {
+        for (int i = 0; i < ctx.size(); i++) {
+            Frame caller = ctx.get(i);
+            if (!isCallerFrame(caller)) continue;
+            int j = i + 1;
+            while (j < ctx.size() && isBufFrame(ctx.get(j))) j++;
+            if (j >= ctx.size() || !isCodecDecodeFrame(ctx.get(j))) continue;
+            String codecClass = ctx.get(j).className();
+            if (codecClass.equals(caller.className())) continue; // bridge decode(Object) -> decode(B)
+            Object match = null;
+            boolean ambiguous = false;
+            for (Object candidate : CallSiteCodecs.codecsAt(caller.className(), caller.methodName(), caller.line())) {
+                if (!candidate.getClass().getName().equals(codecClass)) continue;
+                if (match != null && match != candidate) ambiguous = true;
+                match = candidate;
+            }
+            if (ambiguous) continue;
+            if (match == null && Boolean.getBoolean("extractor.debugSplice")) {
+                System.err.println("[splice] no match at " + caller.key() + " for " + codecClass + " among "
+                        + CallSiteCodecs.codecsAt(caller.className(), caller.methodName(), caller.line()).stream()
+                        .map(c -> c.getClass().getName()).toList());
+            }
+            // unresolvable (built at runtime: entryCodec(actions)) — codecs nested inside it may
+            // still resolve at their own call sites
+            if (match == null || SPLICING.contains(match)) continue;
+            Integer id = SPLICE_IDS.get(match);
+            if (id == null) {
+                id = SPLICED.size();
+                SPLICED.add(match);
+                SPLICE_IDS.put(match, id);
+            }
+            return new Splice(j, id);
+        }
+        return null;
+    }
+
+    static boolean isCallerFrame(Frame f) {
+        String cn = f.className();
+        if (!cn.startsWith("net.minecraft.") || cn.startsWith("net.minecraft.network.codec.")
+                || cn.contains(".nbt.") || cn.contains("$$Lambda")) {
+            return false;
+        }
+        String simple = f.simpleClassName();
+        return !simple.equals("FriendlyByteBuf") && !simple.equals("RegistryFriendlyByteBuf")
+                && !simple.equals("VarInt") && !simple.equals("VarLong") && !simple.equals("Utf8String");
+    }
+
+    static boolean isBufFrame(Frame f) {
+        String simple = f.simpleClassName();
+        return simple.equals("FriendlyByteBuf") || simple.equals("RegistryFriendlyByteBuf");
+    }
+
+    static boolean isCodecDecodeFrame(Frame f) {
+        if (!f.methodName().equals("decode")) return false;
+        return CODEC_CLASSES.computeIfAbsent(f.className(), cn -> {
+            try {
+                return StreamCodec.class.isAssignableFrom(Class.forName(cn, false, DecodeTracer.class.getClassLoader()));
+            } catch (Throwable t) {
+                return false;
+            }
+        });
+    }
+
+    /** The walker's node for a spliced codec — a fresh copy, since naming mutates trees. */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> splicedNode(int id) {
+        Object codec = SPLICED.get(id);
+        Map<String, Object> node = SPLICE_NODES.get(codec);
+        if (node == null) {
+            SPLICING.add(codec);
+            try {
+                node = CodecWalker.walk(codec, null, new java.util.IdentityHashMap<>(), 0, false);
+            } finally {
+                SPLICING.remove(codec);
+            }
+            SPLICE_NODES.put(codec, node);
+        }
+        return (Map<String, Object>) copyTree(node);
+    }
+
     /** Convert events into semantic units, merging events of the same helper invocation. */
     static List<Unit> toUnits(List<Event> events, Class<?> rootClass) {
         List<Unit> units = new ArrayList<>();
         Unit current = null;
-        for (Event ev : events) {
+        for (int evIndex = 0; evIndex < events.size(); evIndex++) {
+            Event ev = events.get(evIndex);
             int helperIdx = -1;
             String wire = null;
             for (int i = 0; i < ev.context().size(); i++) {
@@ -1664,6 +2127,21 @@ public class DecodeTracer {
                     wire = label;
                     break; // outermost helper
                 }
+            }
+            Splice splice = spliceFor(ev.context());
+            if (splice != null && (helperIdx < 0 || splice.frameIndex() < helperIdx)) {
+                List<Frame> path = ev.context().subList(0, splice.frameIndex());
+                String spliceWire = "codec:" + splice.id();
+                String key = pathKey(path) + "@" + spliceWire;
+                if (current != null && current.invocationKey.equals(key)) {
+                    current.bytes += ev.byteLength();
+                    continue;
+                }
+                current = new Unit(structuralPath(path, rootClass), key, spliceWire, ev.byteLength());
+                current.events = events;
+                current.firstEvent = evIndex;
+                units.add(current);
+                continue;
             }
             List<Frame> path;
             String invocationKey;
@@ -1693,7 +2171,8 @@ public class DecodeTracer {
             // reference to their hand-modeled shared type.
             String refType = null;
             for (int i = 0; i < path.size(); i++) {
-                refType = TRACE_REF_OWNERS.get(outerClassName(path.get(i).className()));
+                refType = TRACE_REF_OWNERS.getOrDefault(path.get(i).className(),
+                        TRACE_REF_OWNERS.get(outerClassName(path.get(i).className())));
                 if (refType != null) {
                     path = path.subList(0, i);
                     wire = "ref:" + refType;
@@ -1707,16 +2186,26 @@ public class DecodeTracer {
             boolean newString = current != null && current.stringContentSeen
                     && ev.op().equals("readByte") && hasUtf8Frame(ev.context());
 
+            // A finished varint (last byte without continuation bit) followed by another read
+            // at the same site is a second varint: this(input.readVarInt(), input.readVarInt())
+            boolean newVarint = current != null && current.varintDone
+                    && (wire.equals("VarInt") || wire.equals("VarLong"));
+
             // Same helper invocation (identified by caller path incl. lines) -> same unit.
-            if (current != null && !newString && current.invocationKey.equals(invocationKey) && current.wire.equals(wire)) {
+            if (current != null && !newString && !newVarint
+                    && current.invocationKey.equals(invocationKey) && current.wire.equals(wire)) {
                 current.bytes += ev.byteLength();
+                current.varintDone = varintEnds(ev, wire);
                 if (ev.op().equals("stringContent") || ev.op().equals("readCharSequence")) {
                     current.stringContentSeen = true;
                 }
                 continue;
             }
             current = new Unit(structuralPath(path, rootClass), invocationKey, wire, ev.byteLength());
+            current.events = events;
+            current.firstEvent = evIndex;
             current.stringContentSeen = ev.op().equals("stringContent") || ev.op().equals("readCharSequence");
+            current.varintDone = varintEnds(ev, wire);
             for (Frame f : ev.context()) {
                 if (f.methodName().equals("readCount") && f.simpleClassName().equals("ByteBufCodecs")) {
                     current.countRead = true;
@@ -1727,6 +2216,10 @@ public class DecodeTracer {
         }
         mergeSplitByteArrays(units);
         return units;
+    }
+
+    static boolean varintEnds(Event ev, String wire) {
+        return (wire.equals("VarInt") || wire.equals("VarLong")) && ev.op().equals("readByte") && (ev.value() & 0x80) == 0;
     }
 
     /**
@@ -1740,6 +2233,8 @@ public class DecodeTracer {
             if (!a.wire.equals("VarInt") || !(b.wire.equals("Bytes") || b.wire.equals("Raw Bytes"))) continue;
             if (!sameCallSite(a.path, b.path)) continue;
             Unit merged = new Unit(a.path, a.invocationKey + "+bytes", "Byte Array", a.bytes + b.bytes);
+            merged.events = a.events;
+            merged.firstEvent = a.firstEvent;
             units.set(i, merged);
             units.remove(i + 1);
         }
@@ -1792,7 +2287,9 @@ public class DecodeTracer {
                 stack.add(new GroupLevel(levelKey(u.path, stack.size()), children));
             }
             Map<String, Object> leaf = new LinkedHashMap<>();
-            if (u.wire.startsWith("ref:")) {
+            if (u.wire.startsWith("codec:")) {
+                leaf = splicedNode(Integer.parseInt(u.wire.substring(6)));
+            } else if (u.wire.startsWith("ref:")) {
                 String refName = u.wire.substring(4);
                 leaf.put("kind", "ref");
                 leaf.put("ref", CodecWalker.ensureTraceType(refName));
@@ -1806,6 +2303,7 @@ public class DecodeTracer {
                     leaf.put("x", u.bytes / prim);
                 }
             }
+            if (u.events != null) PerturbNaming.register(leaf, OUTCOME_BY_EVENTS.get(u.events), u.firstEvent);
             currentChildren(stack, rootChildren).add(leaf);
         }
 
@@ -1884,14 +2382,19 @@ public class DecodeTracer {
                 return n;
             }
             case "List" -> {
+                Object count = fields.isEmpty() ? null : fields.getFirst();
                 dropLeading(fields, "VarInt");
-                return replaced(node, "list", "elem", wrap(fields));
+                Map<String, Object> list = replaced(node, "list", "elem", wrap(fields));
+                if (fields.isEmpty() || fields.getFirst() != count) PerturbNaming.transfer(count, list);
+                return list;
             }
             case "Map" -> {
+                Object count = fields.isEmpty() ? null : fields.getFirst();
                 dropLeading(fields, "VarInt");
                 if (fields.isEmpty()) return replaced(node, "map", "key", wrap(fields));
                 Map<String, Object> n = replaced(node, "map", "key", (Map<String, Object>) fields.getFirst());
                 n.put("value", wrap(fields.subList(1, fields.size())));
+                if (fields.getFirst() != count) PerturbNaming.transfer(count, n);
                 return n;
             }
             case "Length-prefixed" -> {
@@ -1910,7 +2413,9 @@ public class DecodeTracer {
                 if (fields.size() >= 2 && fields.getFirst() instanceof Map<?, ?> first
                         && Boolean.TRUE.equals(first.get("_count")) && first.get("name") == null) {
                     fields.removeFirst();
-                    return replaced(node, "list", "elem", wrap(fields));
+                    Map<String, Object> list = replaced(node, "list", "elem", wrap(fields));
+                    PerturbNaming.transfer(first, list);
+                    return list;
                 }
                 // a group with a single read is just a wrapper — inline it
                 if (fields.size() == 1) {
@@ -1971,7 +2476,10 @@ public class DecodeTracer {
             "net.minecraft.core.component.DataComponentPatch", "DataComponentPatch",
             // LpVec3.read takes a zero-vector early exit on the fabricated buffer, so tracing
             // sees a lone byte — collapse to the hand-modeled type instead
-            "net.minecraft.network.LpVec3", "Vec3 (lp)");
+            "net.minecraft.network.LpVec3", "Vec3 (lp)",
+            // exact nested class: id + 1, full signature only for id 0 (older packets call
+            // Packed.read directly rather than through the codec)
+            "net.minecraft.network.chat.MessageSignature$Packed", "MessageSignature.Packed");
 
     static String outerClassName(String className) {
         int inner = className.indexOf('$');
@@ -1980,7 +2488,7 @@ public class DecodeTracer {
 
     static int primitiveSize(String wire) {
         return switch (wire) {
-            case "Byte", "Unsigned Byte", "Boolean" -> 1;
+            case "Byte", "Unsigned Byte", "Boolean", "Bytes" -> 1;
             case "Short", "Unsigned Short", "Char" -> 2;
             case "Int", "Float" -> 4;
             case "Long", "Double" -> 8;
@@ -2033,6 +2541,10 @@ public class DecodeTracer {
         int bytes;
         boolean stringContentSeen;
         boolean countRead;
+        boolean varintDone;
+        /** Trace and index of the unit's first event, for replay-based naming. */
+        List<Event> events;
+        int firstEvent;
 
         Unit(List<Frame> path, String invocationKey, String wire, int bytes) {
             this.path = path;
@@ -2126,7 +2638,8 @@ public class DecodeTracer {
             if (c.getName().startsWith("java.")) break;
             List<Field> own = new ArrayList<>();
             for (Field f : c.getDeclaredFields()) {
-                if (!Modifier.isStatic(f.getModifiers())) own.add(f);
+                // synthetic fields (an inner class's this$0) are no wire data
+                if (!Modifier.isStatic(f.getModifiers()) && !f.isSynthetic()) own.add(f);
             }
             fields.addAll(0, own); // parent fields first
         }
@@ -2181,10 +2694,15 @@ public class DecodeTracer {
             }
         }
 
-        // constructor parameters (skip buffer-reading constructors)
+        // constructor parameters (skip buffer-reading constructors). Merged repeated reads
+        // (Vec3's three doubles as one x=3 node) never stand for one parameter.
+        boolean merged = false;
+        for (Object c : children) merged |= isMergedRead(asMap(c));
         for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
-            if (ctor.getParameterCount() != children.size()) continue;
+            if (merged || ctor.getParameterCount() != children.size()) continue;
             java.lang.reflect.Parameter[] params = ctor.getParameters();
+            // libraries compiled without parameter names (joml) only offer arg0, arg1, ...
+            if (params.length > 0 && !params[0].isNamePresent()) continue;
             // conversion constructors (BlockPos(Vec3i)) name a value after its own supertype
             if (params.length == 1 && params[0].getType().isAssignableFrom(cls)) continue;
             boolean ok = true;
@@ -2294,6 +2812,14 @@ public class DecodeTracer {
         };
     }
 
+    /** A merged repeated read (x=N), possibly inside a single-read wrapper group. */
+    static boolean isMergedRead(Map<String, Object> node) {
+        while (node != null && "group".equals(node.get("kind")) && node.get("fields") instanceof List<?> l && l.size() == 1) {
+            node = asMap(l.getFirst());
+        }
+        return node != null && node.get("x") instanceof Integer;
+    }
+
     /**
      * In-order matching within type buckets (equal counts only); int/long wires may fill
      * object fields (registry ids, instants) when their own bucket runs dry.
@@ -2380,6 +2906,8 @@ public class DecodeTracer {
         String simple = type.getSimpleName();
         if (wire.startsWith("ref:")) {
             // a type reference may only name a field of that type (or a super-interface)
+            Class<?> produced = CodecWalker.TYPE_CLASSES.get(wire.substring(4));
+            if (produced != null && !type.isPrimitive()) return type.isAssignableFrom(produced);
             String base = wire.substring(4);
             int paren = base.indexOf(" (");
             if (paren >= 0) base = base.substring(0, paren);

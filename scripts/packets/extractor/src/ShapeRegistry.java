@@ -38,13 +38,33 @@ public class ShapeRegistry {
         register("dispatch", dummy.dispatch(x -> x, k -> dummy));
         register("optional", ByteBufCodecs.optional(ByteBufCodecs.BOOL));
         register("collection", ByteBufCodecs.collection(ArrayList::new, ByteBufCodecs.BOOL));
+        // newer factories (26.3+) by reflection, so older 26.x jars still compile against this
+        registerFactory("fixedCollection", "fixedSizeCollection", (java.util.function.IntFunction<ArrayList<Object>>) ArrayList::new, ByteBufCodecs.BOOL, 1);
+        registerFactory("fixedBitSet", "fixedBitSet", 1);
         register("mapCodec", ByteBufCodecs.map(HashMap::new, ByteBufCodecs.BOOL, ByteBufCodecs.BOOL));
         register("either", ByteBufCodecs.either(ByteBufCodecs.BOOL, ByteBufCodecs.BOOL));
         register("idMapper", ByteBufCodecs.idMapper(i -> i, x -> 0));
         register("registry", ByteBufCodecs.registry(Registries.ITEM));
         register("holder", ByteBufCodecs.holder(Registries.SOUND_EVENT, StreamCodec.unit(null)));
         register("holderSet", ByteBufCodecs.holderSet(Registries.ITEM));
-        // primitive constants (VAR_INT, BOOL, ...) are their own anonymous classes. Only
+        register("string", ByteBufCodecs.stringUtf8(1));
+        register("byteArray", ByteBufCodecs.byteArray(1));
+        register("nbt", ByteBufCodecs.tagCodec(NbtAccounter::unlimitedHeap));
+        register("nbt", ByteBufCodecs.compoundTagCodec(NbtAccounter::unlimitedHeap));
+        register("optionalNbt", ByteBufCodecs.optionalTagCodec(NbtAccounter::unlimitedHeap));
+        // fromCodec(ops, codec): decodes an inner wire codec (NBT tag, JSON, ...) and parses it
+        register("parsedCodec", ByteBufCodecs.fromCodec(Codec.BOOL));
+        register("parsedCodec", ByteBufCodecs.fromCodecWithRegistries(Codec.BOOL));
+        register("json", ByteBufCodecs.lenientJson(1));
+        try {
+            register("lengthPrefixed", ByteBufCodecs.BOOL.apply(ByteBufCodecs.lengthPrefixed(1)));
+            register("lengthPrefixed", ByteBufCodecs.registry(Registries.ITEM).apply(ByteBufCodecs.registryFriendlyLengthPrefixed(1)));
+        } catch (Throwable t) {
+            System.err.println("[shapes] lengthPrefixed registration failed: " + t);
+        }
+        // primitive constants (VAR_INT, BOOL, ...) are their own anonymous classes. Registered
+        // last: constants built by factories (STRING_UTF8 = stringUtf8(32767)) share the
+        // factory's class and must keep its kind, or their limits are never read. Only
         // classes declared in ByteBufCodecs itself: constants built from generic combinators
         // (GAME_PROFILE is a composite) must keep their combinator class meaning. "constant"
         // walks like "of" (trace fallback) but its frames form groups, so a hand-written
@@ -61,22 +81,18 @@ public class ShapeRegistry {
                 }
             }
         }
-        register("string", ByteBufCodecs.stringUtf8(1));
-        register("byteArray", ByteBufCodecs.byteArray(1));
-        register("nbt", ByteBufCodecs.tagCodec(NbtAccounter::unlimitedHeap));
-        register("nbt", ByteBufCodecs.compoundTagCodec(NbtAccounter::unlimitedHeap));
-        register("optionalNbt", ByteBufCodecs.optionalTagCodec(NbtAccounter::unlimitedHeap));
-        // fromCodec(ops, codec): decodes an inner wire codec (NBT tag, JSON, ...) and parses it
-        register("parsedCodec", ByteBufCodecs.fromCodec(Codec.BOOL));
-        register("parsedCodec", ByteBufCodecs.fromCodecWithRegistries(Codec.BOOL));
-        register("json", ByteBufCodecs.lenientJson(1));
-        try {
-            register("lengthPrefixed", ByteBufCodecs.BOOL.apply(ByteBufCodecs.lengthPrefixed(1)));
-            register("lengthPrefixed", ByteBufCodecs.registry(Registries.ITEM).apply(ByteBufCodecs.registryFriendlyLengthPrefixed(1)));
-        } catch (Throwable t) {
-            System.err.println("[shapes] lengthPrefixed registration failed: " + t);
-        }
         System.err.println("[shapes] registered " + CLASS_KINDS.size() + " combinator classes");
+    }
+
+    static void registerFactory(String kind, String method, Object... args) {
+        for (java.lang.reflect.Method m : ByteBufCodecs.class.getMethods()) {
+            if (!m.getName().equals(method) || m.getParameterCount() != args.length) continue;
+            try {
+                register(kind, m.invoke(null, args));
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     static void register(String kind, Object sample) {
