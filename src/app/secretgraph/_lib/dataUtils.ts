@@ -10,6 +10,20 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 const MIN_SERVER_COUNT = 10;
 
+/**
+ * Versions whose early data is pre-release noise above the noise floor (e.g. Spigot reporting
+ * 26.3 months before it existed): counts before these dates (YYYY-MM-DD) are ignored entirely.
+ */
+const VERSION_START_DATES: Record<string, string> = {
+  '26.3': '2026-08-12',
+};
+
+function versionCount(versionData: Record<string, number>, version: string, day: string, filter: boolean): number {
+  const startDate = VERSION_START_DATES[version];
+  if (startDate !== undefined && day < startDate) return 0;
+  return count(versionData[version], filter);
+}
+
 function count(value: number | undefined, filter: boolean): number {
   if (value === undefined) return 0;
   return filter && value < MIN_SERVER_COUNT ? 0 : value;
@@ -43,7 +57,7 @@ export function processChartData(
 
     // Until the graph starts, only counts above the noise floor count as data
     const started = lastDate !== null;
-    const { point, hasData } = buildDataPoint(date, entry.data, platformIds, selectedVersions, sumMode, !started);
+    const { point, hasData } = buildDataPoint(date, entry.date, entry.data, platformIds, selectedVersions, sumMode, !started);
     if (!hasData && !started) {
       continue;
     }
@@ -64,6 +78,7 @@ export function processChartData(
 
 function buildDataPoint(
   date: Date,
+  day: string,
   data: Record<string, Record<string, number>>,
   platformIds: string[],
   selectedVersions: string[],
@@ -79,7 +94,7 @@ function buildDataPoint(
     if (sumMode) {
       let sum = 0;
       for (const version of selectedVersions) {
-        sum += count(versionData[version], filter);
+        sum += versionCount(versionData, version, day, filter);
       }
       if (sum !== 0 || hasData) {
         hasData = true;
@@ -87,7 +102,7 @@ function buildDataPoint(
       point[platformId] = sum;
     } else {
       for (const version of selectedVersions) {
-        const value = count(versionData[version], filter);
+        const value = versionCount(versionData, version, day, filter);
         if (value !== 0) hasData = true;
         point[`${platformId}_${version}`] = value;
       }
