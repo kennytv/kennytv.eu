@@ -5,20 +5,20 @@
     "": {
       "name": "kennytv-eu",
       "dependencies": {
-        "@tailwindcss/postcss": "^4.3.3",
-        "lucide-react": "^1.59.0",
-        "next": "^16.4.2",
-        "react": "^19.3.1",
-        "react-dom": "^19.3.1",
-        "recharts": "^3.10.1",
-        "tailwindcss": "^4.3.3",
+        "@tailwindcss/postcss": "latest",
+        "lucide-react": "latest",
+        "next": "latest",
+        "react": "latest",
+        "react-dom": "latest",
+        "recharts": "latest",
+        "tailwindcss": "latest",
       },
       "devDependencies": {
-        "@types/node": "^26.6.5",
-        "@types/react": "^19.3.0",
-        "@types/react-dom": "^19.3.0",
-        "next-sitemap": "^4.2.3",
-        "typescript": "^7.0.2",
+        "@types/node": "latest",
+        "@types/react": "latest",
+        "@types/react-dom": "latest",
+        "next-sitemap": "latest",
+        "typescript": "latest",
       },
     },
   },
@@ -311,7 +311,7 @@
 
     "lightningcss-win32-x64-msvc": ["lightningcss-win32-x64-msvc@1.32.0", "", { "os": "win32", "cpu": "x64" }, "sha512-Amq9B/SoZYdDi1kFrojnoqPLxYhQ4Wo5XiL8EVJrVsB8ARoC1PWW6VGtT0WKCemjy8aC+louJnjS7U18x3b06Q=="],
 
-    "lucide-react": ["lucide-react@1.59.0", "", { "peerDependencies": { "@types/react": "*", "react": "^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0" }, "optionalPeers": ["@types/react"] }, "sha512-5qgMyyCPU6OvnKpLS2t693+ZtiqA8oaSweWoUows0BLFKFf6V75m4+CptpmohZHpD5IuOVIBXHBBiv2vpLJmtw=="],
+    "lucide-react": ["lucide-react@1.61.0", "", { "peerDependencies": { "@types/react": "*", "react": "^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0" }, "optionalPeers": ["@types/react"] }, "sha512-v2SQPPPNjnr+BlhL9Spuzmo5yR+hLkftfuE4E3jaxdNPgSH0hJKPcLJBP7yAta87jQNPsSERS59PJjCJ/CorBA=="],
 
     "magic-string": ["magic-string@0.30.21", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.5" } }, "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ=="],
 
